@@ -1,0 +1,14 @@
+[package]
+name = "lainstudio_gui"
+version = "0.1.0"
+edition = "2021"
+description = "Immediate-mode GUI window (egui / eframe)"
+rust-version = "1.76"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true }
+egui = "0.31"
+
+[profile.release]
+opt-level = 2
+lto = true
