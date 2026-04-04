@@ -3,6 +3,7 @@
 //! decode_execute: match op>>12 → llvm jump table, o1 per opcode
 //! step_n: no step() wrapper, unchecked flash, skip redundant wrapping_add
 //! run_timed: 100k_step batches, one Instant::now per batch
+//! .
 
 use super::io_map;
 
