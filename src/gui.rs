@@ -14,9 +14,10 @@ use crate::avr::cpu::StepResult;
 use crate::avr::Cpu;
 use crate::editor::TextEditor;
 use crate::docs::{show_flash_locations_window, show_isa_window};
+use crate::cycle_helper::{show_cycle_helper, CycleHelperState};
 use crate::sim_panel::{
     show_sim_panel, BreakpointState, BpAction, FlashState, SimAction, SimTab,
-    SpeedLimitState,
+    SpeedLimitState, StackState, XmemState,
 };
 use crate::toolbar::{show_toolbar, ToolbarAction};
 use crate::word_helper::{show_word_helper, WordHelperState};
@@ -172,6 +173,10 @@ pub struct LainApp {
     show_flash_locations: bool,
     show_word_helper: bool,
     word_helper_state: WordHelperState,
+    show_cycle_helper: bool,
+    cycle_helper_state: CycleHelperState,
+    stack_state: StackState,
+    xmem_state:  XmemState,
     speed_limit: SpeedLimitState,
     breakpoints: BreakpointState,
     // auto_run_state
@@ -201,6 +206,10 @@ impl LainApp {
             show_flash_locations: false,
             show_word_helper: false,
             word_helper_state: WordHelperState::default(),
+            show_cycle_helper: false,
+            cycle_helper_state: CycleHelperState::default(),
+            stack_state: StackState::default(),
+            xmem_state:  XmemState::default(),
             speed_limit: SpeedLimitState::default(),
             breakpoints: BreakpointState::default(),
             auto_running: false,
@@ -438,7 +447,10 @@ impl LainApp {
             },
             ToolbarAction::SimTogglePanel => {
                 self.show_sim = !self.show_sim;
-                if self.show_sim { self.show_word_helper = false; }
+                if self.show_sim {
+                    self.show_word_helper  = false;
+                    self.show_cycle_helper = false;
+                }
             }
             ToolbarAction::DocsInstructionSet => {
                 self.show_isa = true;
@@ -448,7 +460,17 @@ impl LainApp {
             }
             ToolbarAction::HelpersWordHelper => {
                 self.show_word_helper = !self.show_word_helper;
-                if self.show_word_helper { self.show_sim = false; }
+                if self.show_word_helper {
+                    self.show_sim          = false;
+                    self.show_cycle_helper = false;
+                }
+            }
+            ToolbarAction::HelpersCycleHelper => {
+                self.show_cycle_helper = !self.show_cycle_helper;
+                if self.show_cycle_helper {
+                    self.show_sim         = false;
+                    self.show_word_helper = false;
+                }
             }
         }
     }
@@ -649,14 +671,14 @@ impl eframe::App for LainApp {
                         &workspace.root,
                         self.editor.is_dirty(),
                         self.show_sim,
-                        self.show_word_helper,
+                        self.show_word_helper || self.show_cycle_helper,
                     );
                 });
         }
 
-        // rhs_panel_editor_only: sim or word_helper, mutually exclusive
+        // rhs_panel_editor_only: sim or helpers, mutually exclusive
         let mut sim_action = SimAction::None;
-        let rhs_open = (self.show_sim || self.show_word_helper)
+        let rhs_open = (self.show_sim || self.show_word_helper || self.show_cycle_helper)
             && matches!(self.phase, AppPhase::Editor { .. });
 
         if rhs_open {
@@ -676,11 +698,15 @@ impl eframe::App for LainApp {
                             &mut self.flash_state,
                             &mut self.speed_limit,
                             &mut self.breakpoints,
+                            &mut self.stack_state,
+                            &mut self.xmem_state,
                         );
                     } else if self.show_word_helper {
-                        // collect .lain files from workspace for the helper dropdowns
                         let files = self.collect_lain_files();
                         show_word_helper(ui, &mut self.word_helper_state, &files);
+                    } else if self.show_cycle_helper {
+                        let files = self.collect_lain_files();
+                        show_cycle_helper(ui, &mut self.cycle_helper_state, &files);
                     }
                 });
         }
@@ -826,6 +852,12 @@ impl eframe::App for LainApp {
                     self.limit_clock      = std::time::Instant::now();
                     self.limit_steps_done = 0;
                 }
+            }
+            SimAction::SetIoBit { addr, mask } => {
+                self.sim.set_io_bit(addr, mask);
+            }
+            SimAction::SetXmem(size) => {
+                self.sim.configure_xmem(size);
             }
         }
 

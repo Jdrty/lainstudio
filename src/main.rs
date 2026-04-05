@@ -1,6 +1,7 @@
 //! entry
 
 mod avr;
+mod cycle_helper;
 mod docs;
 mod editor;
 mod gui;

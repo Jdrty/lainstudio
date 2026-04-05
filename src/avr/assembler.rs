@@ -38,6 +38,10 @@ fn assemble_inner(
     source: &str,
     build_map: bool,
 ) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
+    // preprocess: normalize local numeric labels (1: / 1b / 1f)
+    let preprocessed = normalize_local_labels(source);
+    let source = preprocessed.as_str();
+
     // pass_0 builtins_then_user_equ sym resolves in_order no_forward_equ
     let mut equates = builtin_equates();
     for raw in source.lines() {
@@ -60,12 +64,15 @@ fn assemble_inner(
             addr = new_addr;
             continue;
         }
-        if line.starts_with('.') { continue; } // other directives
-        if let Some(lbl) = label_name(line) {
+        let is_data = is_data_directive(line);
+        if line.starts_with('.') && !is_data { continue; } // skip non-data directives
+        let (maybe_label, instr_part) = split_label_instr(line);
+        if let Some(lbl) = maybe_label {
             labels.insert(lbl.to_lowercase(), addr);
-            continue;
         }
-        addr += instruction_words(line);
+        if !instr_part.is_empty() {
+            addr += instruction_words(instr_part);
+        }
     }
 
     // pass_2 encode_org_nop_pad
@@ -93,10 +100,14 @@ fn assemble_inner(
             }
             continue;
         }
-        if line.starts_with('.') { continue; } // other directives
-        if label_name(line).is_some() { continue; }
+        let is_data = is_data_directive(line);
+        if line.starts_with('.') && !is_data { continue; } // skip non-data directives
+        let (maybe_label, instr_part) = split_label_instr(line);
+        // pure label line – nothing to encode
+        if maybe_label.is_some() && instr_part.is_empty() { continue; }
+        let instr_line = if maybe_label.is_some() { instr_part } else { line };
         if build_map { source_map.push((line_nr, addr)); }
-        match encode(line, addr, &labels, &equates) {
+        match encode(instr_line, addr, &labels, &equates) {
             Ok(encoded) => { addr += encoded.len() as u32; words.extend(encoded); }
             Err(msg)    => errors.push(AsmError { line: line_nr, msg }),
         }
@@ -120,10 +131,41 @@ fn builtin_equates() -> HashMap<String, u32> {
     // add closure lowercases keys
     let mut add = |k: &str, v: u32| { m.insert(k.to_lowercase(), v); };
 
-    // io_addrs_io_names
+    // io_addrs_io_names (standard IO, 6-bit address for IN/OUT)
     for &(name, io_addr) in io_map::IO_NAMES {
         add(name, io_addr as u32);
     }
+
+    // ext_io_data_addrs lds_sts_only (data addresses >= 0x60, not in IO_NAMES)
+    add("PINF",   io_map::PINF   as u32);
+    add("DDRF",   io_map::DDRF   as u32);
+    add("PORTF",  io_map::PORTF  as u32);
+    add("PING",   io_map::PING   as u32);
+    add("DDRG",   io_map::DDRG   as u32);
+    add("PORTG",  io_map::PORTG  as u32);
+    add("EICRA",  io_map::EICRA  as u32);
+    add("ETIFR",  io_map::ETIFR  as u32);
+    add("ETIMSK", io_map::ETIMSK as u32);
+    add("ICR3L",  io_map::ICR3L  as u32);
+    add("ICR3H",  io_map::ICR3H  as u32);
+    add("OCR3CL", io_map::OCR3CL as u32);
+    add("OCR3CH", io_map::OCR3CH as u32);
+    add("OCR3BL", io_map::OCR3BL as u32);
+    add("OCR3BH", io_map::OCR3BH as u32);
+    add("OCR3AL", io_map::OCR3AL as u32);
+    add("OCR3AH", io_map::OCR3AH as u32);
+    add("TCNT3L", io_map::TCNT3L as u32);
+    add("TCNT3H", io_map::TCNT3H as u32);
+    add("TCCR3B", io_map::TCCR3B as u32);
+    add("TCCR3A", io_map::TCCR3A as u32);
+    add("TCCR3C", io_map::TCCR3C as u32);
+    add("UBRR0H", io_map::UBRR0H as u32);
+    add("UCSR1A", io_map::UCSR1A as u32);
+    add("UCSR1B", io_map::UCSR1B as u32);
+    add("UCSR1C", io_map::UCSR1C as u32);
+    add("UBRR1H", io_map::UBRR1H as u32);
+    add("UBRR1L", io_map::UBRR1L as u32);
+    add("UDR1",   io_map::UDR1   as u32);
 
     // memory_map_constants
     add("RAMSTART",   0x0100);
@@ -272,6 +314,14 @@ fn builtin_equates() -> HashMap<String, u32> {
     add("INT0", 0); add("INT1", 1); add("INT2", 2); add("INT3", 3);
     add("INT4", 4); add("INT5", 5); add("INT6", 6); add("INT7", 7);
 
+    // eeprom_control_bits (EECR register)
+    add("EERE",  0); // read enable
+    add("EEWE",  1); // write enable
+    add("EEMWE", 2); // master write enable
+    add("EERIE", 3); // ready interrupt enable
+    add("EEPM0", 4);
+    add("EEPM1", 5);
+
     // wdt_bits
     add("WDP0", 0); add("WDP1", 1); add("WDP2", 2); add("WDE", 3); add("WDCE", 4);
 
@@ -318,21 +368,174 @@ fn parse_equate_name(line: &str) -> Option<(String, &str)> {
 // helpers
 
 fn strip_comment(line: &str) -> &str {
-    line.find(';').map(|i| &line[..i]).unwrap_or(line)
+    // strip ; (asm comment) and # (C preprocessor / GAS comment)
+    let line = line.find(';').map(|i| &line[..i]).unwrap_or(line);
+    line.find('#').map(|i| &line[..i]).unwrap_or(line)
 }
 
-fn label_name(line: &str) -> Option<&str> {
-    if let Some(name) = line.strip_suffix(':') {
-        let name = name.trim();
-        if !name.is_empty() && !name.contains(' ') { return Some(name); }
+/// Split a line into an optional leading label and the remaining instruction text.
+/// Handles both `label:` (standalone) and `label: instruction` (same-line, GAS style).
+fn split_label_instr(line: &str) -> (Option<&str>, &str) {
+    if let Some(colon) = line.find(':') {
+        let before = &line[..colon];
+        // Label must be a non-empty identifier token (no whitespace inside)
+        if !before.is_empty() && !before.contains(|c: char| c.is_whitespace()) {
+            let rest = line[colon + 1..].trim();
+            return (Some(before.trim()), rest);
+        }
     }
-    None
+    (None, line)
+}
+
+
+/// Rewrite local numeric GAS labels (`1:`, `2:`, …) to unique internal names,
+/// and replace all `Nb` / `Nf` references accordingly.
+fn normalize_local_labels(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+
+    // Pass 1: number each `N:` occurrence → unique name __L{digit}_{idx}
+    // local_defs[digit] = Vec<(line_index, unique_name)>
+    let mut local_defs: std::collections::HashMap<u32, Vec<(usize, String)>> = Default::default();
+    let mut counters:   std::collections::HashMap<u32, usize>                 = Default::default();
+
+    for (ln, raw) in lines.iter().enumerate() {
+        let stripped = strip_comment(raw).trim();
+        // Accept standalone `N:` or inline `N: instruction`
+        if let (Some(lbl), _) = split_label_instr(stripped) {
+            if !lbl.is_empty() && lbl.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(digit) = lbl.parse::<u32>() {
+                    let cnt = counters.entry(digit).or_insert(0);
+                    let name = format!("__L{digit}_{cnt}");
+                    *cnt += 1;
+                    local_defs.entry(digit).or_default().push((ln, name));
+                }
+            }
+        }
+    }
+
+    if local_defs.is_empty() {
+        return source.to_string();
+    }
+
+    // Build reverse map: line_idx → unique_name (for renaming label definitions)
+    let mut def_at_line: std::collections::HashMap<usize, &str> = Default::default();
+    for def_list in local_defs.values() {
+        for (ln, name) in def_list {
+            def_at_line.insert(*ln, name.as_str());
+        }
+    }
+
+    // Pass 2: rewrite lines — rename label defs AND Nb/Nf refs
+    let mut out = String::with_capacity(source.len() + 64);
+    for (ln, raw) in lines.iter().enumerate() {
+        // If this line has a local numeric label definition, rename it first.
+        let owned;
+        let working = if let Some(&uname) = def_at_line.get(&ln) {
+            let stripped = strip_comment(raw).trim();
+            if let (Some(lbl), _) = split_label_instr(stripped) {
+                if lbl.chars().all(|c| c.is_ascii_digit()) {
+                    // Replace the digit label with its unique name in the raw line.
+                    // Find the first non-whitespace run that equals `lbl` followed by `:`.
+                    let leading_ws = raw.len() - raw.trim_start().len();
+                    let expected = format!("{}:", lbl);
+                    if raw.trim_start().starts_with(&expected) {
+                        owned = format!("{}{}{}",
+                            &raw[..leading_ws],
+                            &format!("{}:", uname),
+                            &raw[leading_ws + expected.len()..]);
+                        owned.as_str()
+                    } else { raw }
+                } else { raw }
+            } else { raw }
+        } else { raw };
+
+        let new_line = rewrite_local_refs(working, ln, &local_defs);
+        out.push_str(&new_line);
+        out.push('\n');
+    }
+    // Remove the trailing newline we added (preserve original ending)
+    if !source.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn rewrite_local_refs(
+    line: &str,
+    current_ln: usize,
+    defs: &std::collections::HashMap<u32, Vec<(usize, String)>>,
+) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut i = 0;
+
+    while i < b.len() {
+        // Detect a potential local-label reference: digit(s) followed by 'b' or 'f',
+        // not preceded by an alphanumeric/underscore char (word boundary).
+        let prev_word = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if !prev_word && b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+            if i < b.len() && (b[i] == b'b' || b[i] == b'f') {
+                let dir = b[i];
+                let next_word = (i + 1) < b.len()
+                    && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_');
+                if !next_word {
+                    let digit_str = &line[start..i];
+                    if let Ok(digit) = digit_str.parse::<u32>() {
+                        if let Some(def_list) = defs.get(&digit) {
+                            let resolved = if dir == b'b' {
+                                // most recent definition at or before this line
+                                def_list.iter()
+                                    .filter(|&&(dl, _)| dl <= current_ln)
+                                    .last()
+                                    .map(|(_, n)| n.as_str())
+                            } else {
+                                // next definition after this line
+                                def_list.iter()
+                                    .find(|&&(dl, _)| dl > current_ln)
+                                    .map(|(_, n)| n.as_str())
+                            };
+                            if let Some(name) = resolved {
+                                out.push_str(name);
+                                i += 1; // consume 'b' or 'f'
+                                continue;
+                            }
+                        }
+                    }
+                    // no match – emit as-is
+                    out.push_str(&line[start..i]);
+                    continue; // don't advance i, loop will push b[i]
+                }
+            }
+            // not a local ref – emit the digits we consumed
+            out.push_str(&line[start..i]);
+            continue;
+        }
+
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_data_directive(line: &str) -> bool {
+    let m = line.split_whitespace().next().unwrap_or("").to_uppercase();
+    matches!(m.as_str(), ".BYTE" | ".WORD" | ".SHORT")
 }
 
 fn instruction_words(line: &str) -> u32 {
-    let (m, _) = line.split_once(|c: char| c.is_whitespace()).unwrap_or((line, ""));
+    let (m, rest) = line.split_once(|c: char| c.is_whitespace()).unwrap_or((line, ""));
     match m.to_uppercase().as_str() {
         "LDS" | "STS" | "JMP" | "CALL" => 2,
+        ".BYTE" => {
+            // each pair of bytes → 1 word; at least 1 word
+            let count = rest.split(',').filter(|s| !s.trim().is_empty()).count();
+            ((count as u32 + 1) / 2).max(1)
+        }
+        ".WORD" | ".SHORT" => {
+            rest.split(',').filter(|s| !s.trim().is_empty()).count() as u32
+        }
         _ => 1,
     }
 }
@@ -348,6 +551,31 @@ fn encode(
     let (mnem_raw, rest) = line.split_once(|c: char| c.is_whitespace()).unwrap_or((line, ""));
     let rest = rest.trim();
     let m = mnem_raw.to_uppercase();
+
+    // data_directives
+    if m == ".BYTE" {
+        let bytes: Vec<u8> = rest.split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| sym(s.trim(), equates).map(|v| v as u8))
+            .collect::<Result<_, _>>()?;
+        if bytes.is_empty() { return Ok(vec![0x0000]); }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let lo = bytes[i] as u16;
+            let hi = if i + 1 < bytes.len() { bytes[i + 1] as u16 } else { 0x00 };
+            out.push(lo | (hi << 8));
+            i += 2;
+        }
+        return Ok(out);
+    }
+    if m == ".WORD" || m == ".SHORT" {
+        let words: Vec<u16> = rest.split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| sym(s.trim(), equates).map(|v| v as u16))
+            .collect::<Result<_, _>>()?;
+        return if words.is_empty() { Ok(vec![0x0000]) } else { Ok(words) };
+    }
 
     // zero_op_insts
     const ZERO_OPS: &[(&str, u16)] = &[
@@ -694,6 +922,12 @@ fn parse_ptr(s: &str) -> Result<Ptr, String> {
                 guard(q <= 63, &format!("Displacement {q} > 63"))?;
                 return Ok(Ptr::Zq(q as u8));
             }
+            if u.starts_with("X+") {
+                return Err(
+                    "X register does not support displacement addressing (AVR ISA); \
+                     use Y+q or Z+q, or manually adjust X before loading".to_string()
+                );
+            }
             return Err(format!("Unknown pointer operand '{s}'"));
         }
     })
@@ -758,6 +992,13 @@ fn guard(cond: bool, msg: &str) -> Result<(), String> {
 
 fn reg(s: &str) -> Result<u32, String> {
     let u = s.trim().to_uppercase();
+    // named aliases (avr-libc / GAS convention)
+    match u.as_str() {
+        "XL" => return Ok(26), "XH" => return Ok(27),
+        "YL" => return Ok(28), "YH" => return Ok(29),
+        "ZL" => return Ok(30), "ZH" => return Ok(31),
+        _ => {}
+    }
     let digits = u.strip_prefix('R').ok_or_else(|| format!("Expected register, got '{s}'"))?;
     let n: u32 = digits.parse().map_err(|_| format!("Invalid register '{s}'"))?;
     guard(n <= 31, &format!("R{n} out of range"))?;
@@ -770,26 +1011,193 @@ fn imm_u8_sym(s: &str, equates: &HashMap<String, u32>) -> Result<u8, String> {
     Ok(v as u8)
 }
 
-/// sym low_high_equ_lit
+// -- expression evaluator: handles (1 << N) | ... style operands --
+
+#[derive(Clone, Debug)]
+enum ExprTok {
+    Num(u32),
+    Id(String),
+    Shl,
+    Shr,
+    LParen,
+    RParen,
+    Op(char),
+}
+
+fn tokenize_expr(s: &str) -> Result<Vec<ExprTok>, String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<ExprTok> = Vec::new();
+    while i < b.len() {
+        match b[i] {
+            c if (c as char).is_ascii_whitespace() => { i += 1; }
+            b'(' => { out.push(ExprTok::LParen); i += 1; }
+            b')' => { out.push(ExprTok::RParen); i += 1; }
+            b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b'~'
+                => { out.push(ExprTok::Op(b[i] as char)); i += 1; }
+            b'<' if i + 1 < b.len() && b[i + 1] == b'<' => { out.push(ExprTok::Shl); i += 2; }
+            b'>' if i + 1 < b.len() && b[i + 1] == b'>' => { out.push(ExprTok::Shr); i += 2; }
+            b'$' => {
+                i += 1;
+                let start = i;
+                while i < b.len() && b[i].is_ascii_hexdigit() { i += 1; }
+                if i == start { return Err("empty $hex literal".to_string()); }
+                out.push(ExprTok::Num(
+                    u32::from_str_radix(&s[start..i], 16)
+                        .map_err(|_| "invalid $hex".to_string())?,
+                ));
+            }
+            c if (c as char).is_ascii_digit() => {
+                if b[i] == b'0' && i + 1 < b.len() && b[i + 1] == b'x' {
+                    i += 2;
+                    let start = i;
+                    while i < b.len() && b[i].is_ascii_hexdigit() { i += 1; }
+                    out.push(ExprTok::Num(
+                        u32::from_str_radix(&s[start..i], 16)
+                            .map_err(|_| "invalid 0x literal".to_string())?,
+                    ));
+                } else if b[i] == b'0' && i + 1 < b.len() && b[i + 1] == b'b' {
+                    i += 2;
+                    let start = i;
+                    while i < b.len() && (b[i] == b'0' || b[i] == b'1') { i += 1; }
+                    out.push(ExprTok::Num(
+                        u32::from_str_radix(&s[start..i], 2)
+                            .map_err(|_| "invalid 0b literal".to_string())?,
+                    ));
+                } else {
+                    let start = i;
+                    while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+                    out.push(ExprTok::Num(
+                        s[start..i].parse::<u32>()
+                            .map_err(|_| "invalid decimal".to_string())?,
+                    ));
+                }
+            }
+            c if (c as char).is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
+                out.push(ExprTok::Id(s[start..i].to_string()));
+            }
+            c => return Err(format!("unexpected character '{}' in expression", c as char)),
+        }
+    }
+    Ok(out)
+}
+
+fn expr_or(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_xor(t, p, eq)?;
+    while matches!(t.get(*p), Some(ExprTok::Op('|'))) { *p += 1; v |= expr_xor(t, p, eq)?; }
+    Ok(v)
+}
+fn expr_xor(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_and(t, p, eq)?;
+    while matches!(t.get(*p), Some(ExprTok::Op('^'))) { *p += 1; v ^= expr_and(t, p, eq)?; }
+    Ok(v)
+}
+fn expr_and(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_shift(t, p, eq)?;
+    while matches!(t.get(*p), Some(ExprTok::Op('&'))) { *p += 1; v &= expr_shift(t, p, eq)?; }
+    Ok(v)
+}
+fn expr_shift(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_add(t, p, eq)?;
+    loop {
+        match t.get(*p) {
+            Some(ExprTok::Shl) => { *p += 1; v = v.wrapping_shl(expr_add(t, p, eq)?); }
+            Some(ExprTok::Shr) => { *p += 1; v = v.wrapping_shr(expr_add(t, p, eq)?); }
+            _ => break,
+        }
+    }
+    Ok(v)
+}
+fn expr_add(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_mul(t, p, eq)?;
+    loop {
+        match t.get(*p) {
+            Some(ExprTok::Op('+')) => { *p += 1; v = v.wrapping_add(expr_mul(t, p, eq)?); }
+            Some(ExprTok::Op('-')) => { *p += 1; v = v.wrapping_sub(expr_mul(t, p, eq)?); }
+            _ => break,
+        }
+    }
+    Ok(v)
+}
+fn expr_mul(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    let mut v = expr_unary(t, p, eq)?;
+    loop {
+        match t.get(*p) {
+            Some(ExprTok::Op('*')) => { *p += 1; v = v.wrapping_mul(expr_unary(t, p, eq)?); }
+            Some(ExprTok::Op('/')) => {
+                *p += 1;
+                let d = expr_unary(t, p, eq)?;
+                if d == 0 { return Err("division by zero".to_string()); }
+                v /= d;
+            }
+            _ => break,
+        }
+    }
+    Ok(v)
+}
+fn expr_unary(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    match t.get(*p) {
+        Some(ExprTok::Op('-')) => { *p += 1; expr_unary(t, p, eq).map(|v| 0u32.wrapping_sub(v)) }
+        Some(ExprTok::Op('~')) => { *p += 1; expr_unary(t, p, eq).map(|v| !v) }
+        _ => expr_atom(t, p, eq),
+    }
+}
+fn expr_atom(t: &[ExprTok], p: &mut usize, eq: &HashMap<String, u32>) -> Result<u32, String> {
+    match t.get(*p).cloned() {
+        Some(ExprTok::Num(n)) => { *p += 1; Ok(n) }
+        Some(ExprTok::LParen) => {
+            *p += 1;
+            let v = expr_or(t, p, eq)?;
+            if matches!(t.get(*p), Some(ExprTok::RParen)) { *p += 1; Ok(v) }
+            else { Err("missing ')' in expression".to_string()) }
+        }
+        Some(ExprTok::Id(name)) => {
+            *p += 1;
+            // function call: id '(' expr ')'
+            if matches!(t.get(*p), Some(ExprTok::LParen)) {
+                *p += 1;
+                let inner = expr_or(t, p, eq)?;
+                if matches!(t.get(*p), Some(ExprTok::RParen)) { *p += 1; }
+                else { return Err(format!("missing ')' after {}()", name)); }
+                return match name.to_lowercase().as_str() {
+                    "lo8"     | "low"  => Ok(inner & 0xFF),
+                    "hi8"     | "high" => Ok((inner >> 8)  & 0xFF),
+                    "hh8"              => Ok((inner >> 16) & 0xFF),
+                    "hlo8"             => Ok((inner >> 8)  & 0xFF),
+                    "hhi8"             => Ok((inner >> 24) & 0xFF),
+                    "pm_lo8"           => Ok((inner >> 1)  & 0xFF),
+                    "pm_hi8"           => Ok((inner >> 9)  & 0xFF),
+                    "pm_hh8"           => Ok((inner >> 17) & 0xFF),
+                    "pm_hlo8"          => Ok((inner >> 9)  & 0xFF),
+                    "gs"               => Ok(inner >> 1),
+                    _ => Err(format!("unknown function '{}'", name)),
+                };
+            }
+            // plain identifier – look up in equates
+            let key = name.to_lowercase();
+            eq.get(key.as_str())
+                .copied()
+                .ok_or_else(|| format!("undefined symbol '{}'", name))
+        }
+        other => Err(format!("unexpected token {:?} in expression", other)),
+    }
+}
+
+/// Evaluate a symbol/expression string: literals, identifiers, operators, function calls.
 fn sym(s: &str, equates: &HashMap<String, u32>) -> Result<u32, String> {
     let s = s.trim();
-    // low_high_recursive
-    if let Some(inner) = s.strip_prefix("low(").and_then(|t| t.strip_suffix(')'))
-        .or_else(|| s.strip_prefix("LOW(").and_then(|t| t.strip_suffix(')')))
-    {
-        return sym(inner, equates).map(|v| v & 0xFF);
+    let toks = tokenize_expr(s)
+        .map_err(|e| format!("Invalid integer '{s}': {e}"))?;
+    let mut pos = 0;
+    let v = expr_or(&toks, &mut pos, equates)
+        .map_err(|_| format!("Invalid integer '{s}'"))?;
+    if pos < toks.len() {
+        return Err(format!("Invalid integer '{s}'"));
     }
-    if let Some(inner) = s.strip_prefix("high(").and_then(|t| t.strip_suffix(')'))
-        .or_else(|| s.strip_prefix("HIGH(").and_then(|t| t.strip_suffix(')')))
-    {
-        return sym(inner, equates).map(|v| (v >> 8) & 0xFF);
-    }
-    // user_equate
-    let key = s.to_lowercase();
-    if let Some(&v) = equates.get(&key) {
-        return Ok(v);
-    }
-    parse_imm(s)
+    Ok(v)
 }
 
 /// io_addr_sym equ_io_names_num
@@ -936,6 +1344,39 @@ mod tests {
         assert_eq!(words.len(), 2);
         assert_eq!(words[0], 0xE304); // ldi_34
         assert_eq!(words[1], 0xE112); // ldi_12
+    }
+
+    #[test]
+    fn asm_avr_as_operators() {
+        // lo8 / hi8 / hh8 / hlo8 / hhi8
+        let src = ".equ V = 0xDEADBEEF\n\
+                   LDI R16, lo8(V)\n\
+                   LDI R17, hi8(V)\n\
+                   LDI R18, hh8(V)\n\
+                   LDI R19, hhi8(V)\n\
+                   LDI R20, hlo8(V)";
+        let words = assemble(src).unwrap();
+        assert_eq!(words.len(), 5);
+        let imm = |w: u16| -> u8 { (((w >> 4) & 0xF0) | (w & 0x0F)) as u8 };
+        assert_eq!(imm(words[0]), 0xEF); // lo8  of 0xDEADBEEF
+        assert_eq!(imm(words[1]), 0xBE); // hi8  of 0xDEADBEEF
+        assert_eq!(imm(words[2]), 0xAD); // hh8  of 0xDEADBEEF
+        assert_eq!(imm(words[3]), 0xDE); // hhi8 of 0xDEADBEEF
+        assert_eq!(imm(words[4]), 0xBE); // hlo8 == hi8
+
+        // pm_lo8 / pm_hi8: divide by 2 first (byte-addr to word-addr)
+        let src2 = ".equ FUNC = 0x0200\n\
+                    LDI R16, pm_lo8(FUNC)\n\
+                    LDI R17, pm_hi8(FUNC)";
+        let words2 = assemble(src2).unwrap();
+        assert_eq!(words2.len(), 2);
+        assert_eq!(imm(words2[0]), 0x00); // (0x200 >> 1) & 0xFF = 0x00
+        assert_eq!(imm(words2[1]), 0x01); // (0x200 >> 9) & 0xFF = 0x01
+
+        // gs: word address (val >> 1)
+        let src3 = ".equ FUNC = 0x0100\nLDI R16, lo8(gs(FUNC))";
+        let words3 = assemble(src3).unwrap();
+        assert_eq!(imm(words3[0]), 0x80); // gs(0x100) = 0x80, lo8 = 0x80
     }
 
     #[test]

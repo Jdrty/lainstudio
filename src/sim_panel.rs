@@ -1,8 +1,8 @@
 //! avr_sim_panel tabs cpu ports timers sram
 
 use eframe::egui::{
-    self, Button, Color32, Frame, Grid, Key, Margin, RichText, ScrollArea, Stroke,
-    TextEdit, Ui,
+    self, Align, Align2, Button, Color32, Frame, Grid, Key, Layout, Margin,
+    RichText, ScrollArea, Stroke, TextEdit, Ui, Window,
 };
 
 use crate::avr::cpu::{
@@ -21,7 +21,15 @@ const FLASH_PER_PAGE: usize = 128;
 const FLASH_TOTAL_PAGES: usize = FLASH_WORDS / FLASH_PER_PAGE; // 512
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break }
+pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break, Stack }
+
+// stack_popup_state
+pub struct StackState {
+    pub popup_open: bool,
+}
+impl Default for StackState {
+    fn default() -> Self { Self { popup_open: false } }
+}
 
 // ── IPS speed-limit state ─────────────────────────────────────────────────────
 
@@ -122,6 +130,17 @@ impl Default for FlashState {
     }
 }
 
+/// Max external SRAM addressable by ATmega128A: 0x1100–0xFFFF = 61184 bytes.
+pub const XMEM_MAX: u32 = 0xEF00;
+
+pub struct XmemState {
+    pub size_text: String,
+}
+
+impl Default for XmemState {
+    fn default() -> Self { Self { size_text: "1024".to_string() } }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimAction {
     None,
@@ -131,6 +150,9 @@ pub enum SimAction {
     Run100,
     Reset,
     AutoToggle,
+    SetIoBit { addr: u16, mask: u8 },
+    /// size == 0 disables XMEM
+    SetXmem(u32),
 }
 
 // entry_point
@@ -145,6 +167,8 @@ pub fn show_sim_panel(
     flash_state:   &mut FlashState,
     speed_limit:   &mut SpeedLimitState,
     bp_state:      &mut BreakpointState,
+    stack_state:   &mut StackState,
+    xmem_state:    &mut XmemState,
 ) -> SimAction {
     let mut action = SimAction::None;
 
@@ -188,6 +212,7 @@ pub fn show_sim_panel(
                     (SimTab::Sram,   "SRAM"),
                     (SimTab::Flash,  "FLASH"),
                     (SimTab::Break,  "BREAK"),
+                    (SimTab::Stack,  "STACK"),
                 ] {
                     let selected   = *active_tab == tab;
                     let color      = if selected { START_GREEN } else { DIM };
@@ -209,20 +234,22 @@ pub fn show_sim_panel(
 
             // scrollable_tab_content
             let avail_h = ui.available_height() - 142.0; // room_for_controls
-            ScrollArea::vertical()
+            let tab_action = ScrollArea::vertical()
                 .id_salt("sim_scroll")
                 .auto_shrink([false, false])
                 .max_height(avail_h.max(120.0))
-                .show(ui, |ui| {
+                .show(ui, |ui| -> SimAction {
                     match *active_tab {
-                        SimTab::Cpu    => show_cpu_tab(ui, cpu, last_result),
-                        SimTab::Ports  => show_ports_tab(ui, cpu),
+                        SimTab::Cpu    => { show_cpu_tab(ui, cpu, last_result); SimAction::None }
+                        SimTab::Ports  => { show_ports_tab(ui, cpu);            SimAction::None }
                         SimTab::Timers => show_timers_tab(ui, cpu),
-                        SimTab::Sram   => show_sram_tab(ui, cpu),
-                        SimTab::Flash  => show_flash_tab(ui, cpu, flash_state),
-                        SimTab::Break  => show_break_tab(ui, bp_state),
+                        SimTab::Sram   => show_sram_tab(ui, cpu, xmem_state),
+                        SimTab::Flash  => { show_flash_tab(ui, cpu, flash_state); SimAction::None }
+                        SimTab::Break  => { show_break_tab(ui, bp_state);       SimAction::None }
+                        SimTab::Stack  => show_stack_tab(ui, cpu, stack_state),
                     }
-                });
+                }).inner;
+            if action == SimAction::None { action = tab_action; }
 
             // sticky_controls
             ui.add_space(4.0);
@@ -363,15 +390,16 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
         if addr as usize >= FLASH_WORDS { break; }
         let is_current = addr == pc;
         let arrow  = if is_current { "\u{2192}" } else { " " };
+        let op     = cpu.flash[addr as usize];
         let disasm = cpu.disasm_at(addr);
-        let (color, size) = if is_current { (AMBER, 13.0_f32) } else { (START_GREEN_DIM, 12.0_f32) };
-        // ivt_name_if_match
+        let cyc    = Cpu::instr_cycles_str(op);
+        let color  = if is_current { AMBER } else { START_GREEN_DIM };
         let ivt_ann = Cpu::ivt_name(addr as u32)
             .map(|n| format!("  ; <{n}>"))
             .unwrap_or_default();
         ui.label(
-            RichText::new(format!("{arrow} {:04X}  {disasm}{ivt_ann}", addr))
-                .monospace().size(size).color(color),
+            RichText::new(format!("{arrow} {:04X}  {:<18} [{:>5}]{ivt_ann}", addr, disasm, format!("{cyc}cy")))
+                .monospace().size(12.0).color(color),
         );
     }
 
@@ -456,7 +484,8 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu) {
 
 // timers_tab
 
-fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) {
+fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
+    let mut action = SimAction::None;
     // data_addr_to_io_idx
     let io = &cpu.io;
     let ix = |a: u16| -> u8 { io[(a as usize) - 0x0020] };
@@ -554,18 +583,285 @@ fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) {
     ui.separator();
     ui.add_space(4.0);
 
+    // timer3_ui
+    timer_section(ui, "TIMER 3", "(16-bit)");
+
+    let etifr  = ix(io_map::ETIFR);
+    let etimsk = ix(io_map::ETIMSK);
+
+    let tccr3a = ix(io_map::TCCR3A);
+    let tccr3b = ix(io_map::TCCR3B);
+    let tccr3c = ix(io_map::TCCR3C);
+    let tcnt3  = (ix(io_map::TCNT3H) as u16) << 8 | ix(io_map::TCNT3L) as u16;
+    let ocr3a  = (ix(io_map::OCR3AH) as u16) << 8 | ix(io_map::OCR3AL) as u16;
+    let ocr3b  = (ix(io_map::OCR3BH) as u16) << 8 | ix(io_map::OCR3BL) as u16;
+    let ocr3c  = (ix(io_map::OCR3CH) as u16) << 8 | ix(io_map::OCR3CL) as u16;
+    let cs3    = tccr3b & 0x07;
+    let ctc3   = (tccr3b & 0x08) != 0;
+
+    Grid::new("t3_grid").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "TCCR3A", &format!("{tccr3a:02X}"), "");
+        kv3(ui, "TCCR3B", &format!("{tccr3b:02X}"),
+            &format!("{}  {}", t01_cs_str(cs3), if ctc3 { "CTC" } else { "Normal" }));
+        kv3(ui, "TCCR3C", &format!("{tccr3c:02X}"), "");
+        kv3(ui, "TCNT3",  &format!("{tcnt3:04X}"), &format!("[{}]", tcnt3));
+        kv3(ui, "OCR3A",  &format!("{ocr3a:04X}"), &format!("[{}]", ocr3a));
+        kv3(ui, "OCR3B",  &format!("{ocr3b:04X}"), &format!("[{}]", ocr3b));
+        kv3(ui, "OCR3C",  &format!("{ocr3c:04X}"), &format!("[{}]", ocr3c));
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        flag_lbl(ui, "TOV3",   etifr & 0x10 != 0);
+        flag_lbl(ui, "OCF3A",  etifr & 0x08 != 0);
+        flag_lbl(ui, "OCF3B",  etifr & 0x04 != 0);
+        flag_lbl(ui, "OCF3C",  etifr & 0x02 != 0);
+        ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
+        flag_lbl(ui, "TOIE3",  etimsk & 0x10 != 0);
+        flag_lbl(ui, "OCIE3A", etimsk & 0x08 != 0);
+        flag_lbl(ui, "OCIE3B", etimsk & 0x04 != 0);
+        flag_lbl(ui, "OCIE3C", etimsk & 0x02 != 0);
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+
     // timsk_tifr_raw
     section_label(ui, "REGISTERS (raw)");
     ui.add_space(2.0);
     Grid::new("tmr_raw").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
-        kv3(ui, "TIMSK", &format!("{timsk:02X}"), &format!("{timsk:08b}b"));
-        kv3(ui, "TIFR",  &format!("{tifr:02X}"),  &format!("{tifr:08b}b"));
+        kv3(ui, "TIMSK",  &format!("{timsk:02X}"),  &format!("{timsk:08b}b"));
+        kv3(ui, "TIFR",   &format!("{tifr:02X}"),   &format!("{tifr:08b}b"));
+        kv3(ui, "ETIMSK", &format!("{etimsk:02X}"), &format!("{etimsk:08b}b"));
+        kv3(ui, "ETIFR",  &format!("{etifr:02X}"),  &format!("{etifr:08b}b"));
     });
+
+    // manual_interrupt_triggers
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    section_label(ui, "MANUAL IRQ TRIGGERS");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Force-set interrupt flags to test ISRs (SREG I must be set).")
+            .monospace().size(10.5).color(DIM),
+    );
+    ui.add_space(6.0);
+
+    let mut trig_btn = |ui: &mut Ui, label: &str, addr: u16, mask: u8| {
+        if ui.add(
+            Button::new(RichText::new(label).monospace().size(11.0).color(Color32::BLACK))
+                .fill(START_GREEN_DIM)
+                .stroke(Stroke::new(1.0, START_GREEN)),
+        ).clicked() {
+            action = SimAction::SetIoBit { addr, mask };
+        }
+    };
+
+    timer_section(ui, "TIMER 0 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV0", io_map::TIFR, 0x01);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF0", io_map::TIFR, 0x02);
+    });
+    ui.add_space(4.0);
+
+    timer_section(ui, "TIMER 1 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV1",  io_map::TIFR, 0x04);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF1A", io_map::TIFR, 0x10);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF1B", io_map::TIFR, 0x08);
+        ui.add_space(4.0);
+        trig_btn(ui, "ICF1",  io_map::TIFR, 0x20);
+    });
+    ui.add_space(4.0);
+
+    timer_section(ui, "TIMER 2 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV2", io_map::TIFR, 0x40);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF2", io_map::TIFR, 0x80);
+    });
+    ui.add_space(4.0);
+
+    timer_section(ui, "TIMER 3 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV3",  io_map::ETIFR, 0x10);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF3A", io_map::ETIFR, 0x08);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF3B", io_map::ETIFR, 0x04);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF3C", io_map::ETIFR, 0x02);
+    });
+
+    action
+}
+
+/// How many Port C pins are required to address `size` bytes of external memory.
+fn xmem_portc_pins(size: u32) -> u8 {
+    if size <= 256 { return 0; }
+    // bits_needed = ceil(log2(size)) = 32 - leading_zeros(size - 1)
+    let bits = 32u32.saturating_sub((size - 1).leading_zeros());
+    bits.saturating_sub(8).min(8) as u8
 }
 
 // sram_tab
-fn show_sram_tab(ui: &mut Ui, cpu: &Cpu) {
+fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
+    let mut action = SimAction::None;
     let sp = cpu.sp;
+
+    // ── XMEM config ──────────────────────────────────────────────────────────
+    let xmem_active = !cpu.xmem.is_empty();
+    let xmem_size   = cpu.xmem.len() as u32;
+
+    ui.separator();
+    ui.add_space(2.0);
+    section_label(ui, "EXTERNAL SRAM (XMEM)");
+    ui.add_space(4.0);
+
+    ui.label(
+        RichText::new(
+            "Maps data addresses 0x1100–0x(end) to an external SRAM chip via a \
+             multiplexed bus. Hardware pins are assigned automatically; no DDR \
+             configuration is required or possible for these pins.",
+        )
+        .monospace().size(10.0).color(DIM),
+    );
+    ui.add_space(6.0);
+
+    // size_input_row
+    let parsed_size: Option<u32> = xmem.size_text.trim().parse::<u32>().ok()
+        .filter(|&v| v > 0 && v <= XMEM_MAX);
+    let input_ok = parsed_size.is_some();
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Size:").monospace().size(11.0).color(START_GREEN_DIM));
+        let resp = ui.add(
+            TextEdit::singleline(&mut xmem.size_text)
+                .desired_width(72.0)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label(RichText::new("bytes").monospace().size(11.0).color(DIM));
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("(max {})", XMEM_MAX))
+                .monospace().size(10.0).color(DIM),
+        );
+        let _ = resp;
+    });
+
+    if !input_ok && !xmem.size_text.trim().is_empty() {
+        ui.label(
+            RichText::new(format!("✗ must be 1–{XMEM_MAX}"))
+                .monospace().size(10.5).color(ERR_RED),
+        );
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        // ENABLE button
+        let can_enable = input_ok;
+        if ui.add_enabled(
+            can_enable,
+            Button::new(RichText::new("ENABLE XMEM").monospace().size(11.0).color(Color32::BLACK))
+                .fill(if xmem_active { AMBER } else { START_GREEN_DIM })
+                .stroke(Stroke::new(1.0, START_GREEN)),
+        ).clicked() {
+            if let Some(sz) = parsed_size { action = SimAction::SetXmem(sz); }
+        }
+        ui.add_space(6.0);
+        if ui.add(
+            Button::new(RichText::new("DISABLE").monospace().size(11.0).color(Color32::BLACK))
+                .fill(DIM)
+                .stroke(Stroke::new(1.0, DIM)),
+        ).clicked() {
+            action = SimAction::SetXmem(0);
+        }
+        if xmem_active {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("ACTIVE  {xmem_size} B  (0x1100–0x{:04X})", 0x1100 + xmem_size - 1))
+                    .monospace().size(11.0).color(AMBER),
+            );
+        }
+    });
+
+    // pin_assignment
+    if xmem_active {
+        let portc_n = xmem_portc_pins(xmem_size);
+        let portc_mask: u8 = if portc_n >= 8 { 0xFF } else { (1u8 << portc_n).wrapping_sub(1) };
+
+        ui.add_space(6.0);
+        section_label(ui, "DEDICATED PINS");
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("PG0=/RD  PG1=/WR  PG2=ALE")
+                .monospace().size(11.0).color(START_GREEN_DIM),
+        );
+        ui.label(
+            RichText::new("PA0–PA7 = XAD0–XAD7   (data + lower address, always)")
+                .monospace().size(11.0).color(START_GREEN_DIM),
+        );
+        if portc_n == 0 {
+            ui.label(
+                RichText::new("Port C: free  (size ≤ 256 B, upper address not needed)")
+                    .monospace().size(11.0).color(DIM),
+            );
+        } else {
+            let pc_hi = portc_n - 1;
+            ui.label(
+                RichText::new(format!("PC0–PC{pc_hi} = XA8–XA{}   (upper address)", 7 + portc_n))
+                    .monospace().size(11.0).color(START_GREEN_DIM),
+            );
+            if portc_n < 8 {
+                let free_lo = portc_n;
+                ui.label(
+                    RichText::new(format!("PC{free_lo}–PC7: free  ({} pins)", 8 - portc_n))
+                        .monospace().size(11.0).color(DIM),
+                );
+            }
+        }
+
+        // conflict_detection
+        let ddra  = cpu.read_mem(io_map::DDRA);
+        let ddrc  = cpu.read_mem(io_map::DDRC);
+        let ddrg  = cpu.read_mem(io_map::DDRG);
+
+        let conflict_a = ddra != 0;
+        let conflict_c = portc_n > 0 && (ddrc & portc_mask) != 0;
+        let conflict_g = (ddrg & 0x07) != 0;
+
+        if conflict_a || conflict_c || conflict_g {
+            ui.add_space(4.0);
+            section_label(ui, "PIN CONFLICTS");
+            ui.add_space(2.0);
+            if conflict_a {
+                ui.label(
+                    RichText::new(format!("⚠ DDRA=0x{ddra:02X}: Port A pins set as GPIO output — XMEM takes priority"))
+                        .monospace().size(10.5).color(ERR_RED),
+                );
+            }
+            if conflict_c {
+                ui.label(
+                    RichText::new(format!("⚠ DDRC=0x{ddrc:02X}: Port C pins PC0–PC{} conflict with XA8–XA{}", portc_n-1, 7+portc_n))
+                        .monospace().size(10.5).color(ERR_RED),
+                );
+            }
+            if conflict_g {
+                ui.label(
+                    RichText::new(format!("⚠ DDRG=0x{ddrg:02X}: PG0–PG2 (/RD,/WR,ALE) conflict with GPIO output"))
+                        .monospace().size(10.5).color(ERR_RED),
+                );
+            }
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
 
     // sp_status
     section_label(ui, "SRAM  0x0100 – 0x10FF  (4 096 bytes)");
@@ -677,6 +973,282 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu) {
                 ui.end_row();
             }
         });
+
+    // xmem_contents
+    if xmem_active && xmem_size > 0 {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        section_label(ui, &format!("XMEM  0x1100 – 0x{:04X}  ({xmem_size} bytes)", 0x1100u32 + xmem_size - 1));
+        ui.add_space(4.0);
+
+        ui.label(
+            RichText::new("  ADDR    +0   +1   +2   +3   +4   +5   +6   +7")
+                .monospace().size(10.5).color(START_GREEN_DIM),
+        );
+        ui.add_space(2.0);
+
+        let mut skipping = false;
+        let rows = ((xmem_size as usize) + 7) / 8;
+        for row in 0..rows {
+            let base = row * 8;
+            let slice_end = (base + 8).min(xmem_size as usize);
+            let slice = &cpu.xmem[base..slice_end];
+            let all0 = slice.iter().all(|&b| b == 0);
+            if all0 && row > 0 {
+                if !skipping {
+                    skipping = true;
+                    ui.label(RichText::new("  ···").monospace().size(10.5).color(DIM));
+                }
+                continue;
+            }
+            skipping = false;
+            let addr = 0x1100u32 + base as u32;
+            let mut line = format!("  0x{addr:04X}  ");
+            for b in slice { line.push_str(&format!(" {b:02X}  ")); }
+            ui.label(RichText::new(line).monospace().size(10.5).color(START_GREEN));
+        }
+    }
+
+    // eeprom_section
+    {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        section_label(ui, "EEPROM  0x000 – 0xFFF  (4 096 bytes, non-volatile)");
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("  Persists across reset. Unprogrammed bytes = 0xFF.")
+                .size(11.0).color(START_GREEN_DIM),
+        );
+        ui.add_space(4.0);
+
+        let ep = &cpu.eeprom;
+        let rows = (ep.len() + 7) / 8;
+        let mut skipping = false;
+
+        ui.label(
+            RichText::new("  ADDR    +0   +1   +2   +3   +4   +5   +6   +7")
+                .monospace().size(10.5).color(START_GREEN_DIM),
+        );
+        ui.add_space(2.0);
+
+        for row in 0..rows {
+            let base = row * 8;
+            let end  = (base + 8).min(ep.len());
+            let slice = &ep[base..end];
+            let all_ff = slice.iter().all(|&b| b == 0xFF);
+            if all_ff {
+                if !skipping {
+                    skipping = true;
+                    ui.label(RichText::new("  ···").monospace().size(10.5).color(DIM));
+                }
+                continue;
+            }
+            skipping = false;
+            let mut line = format!("  0x{base:03X}   ");
+            for b in slice { line.push_str(&format!(" {b:02X}  ")); }
+            ui.label(RichText::new(line).monospace().size(10.5).color(AMBER));
+        }
+    }
+
+    action
+}
+
+// stack_tab
+
+fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
+    let sp  = cpu.sp;
+    let sph = (sp >> 8) as u8;
+    let spl = (sp & 0xFF) as u8;
+
+    section_label(ui, "STACK POINTER");
+    ui.add_space(4.0);
+    Grid::new("sp_grid").num_columns(3).spacing([16.0, 2.0]).show(ui, |ui| {
+        ui.label(RichText::new(format!("SPH  0x{sph:02X}")).monospace().size(13.0).color(AMBER));
+        ui.label(RichText::new(format!("SPL  0x{spl:02X}")).monospace().size(13.0).color(AMBER));
+        ui.label(
+            RichText::new(format!("SP = 0x{sp:04X}")).monospace().size(13.0).color(START_GREEN),
+        );
+        ui.end_row();
+    });
+
+    ui.add_space(4.0);
+    let ramend: u16 = 0x10FF;
+    let stack_top = sp.wrapping_add(1);
+    let depth = if sp < ramend { ramend - sp } else { 0 };
+
+    if sp == 0 {
+        ui.label(RichText::new("SP not initialized (0x0000)").monospace().size(11.0).color(DIM));
+    } else if stack_top > ramend {
+        ui.label(RichText::new("Stack empty (SP = RAMEND)").monospace().size(11.0).color(DIM));
+    } else {
+        ui.label(
+            RichText::new(format!("Stack depth: {depth} bytes  (0x{stack_top:04X} – 0x{ramend:04X})"))
+                .monospace().size(11.5).color(START_GREEN_DIM),
+        );
+    }
+
+    ui.add_space(6.0);
+    if ui.add(
+        Button::new(RichText::new("STACK FRAMES").monospace().size(11.5).color(Color32::BLACK))
+            .fill(START_GREEN_DIM)
+            .stroke(Stroke::new(1.0, START_GREEN)),
+    ).clicked() {
+        s.popup_open = true;
+    }
+
+    // stack_bytes_grid
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    section_label(ui, "STACK CONTENTS  (SP+1 → RAMEND)");
+    ui.add_space(4.0);
+
+    if depth == 0 || sp == 0 {
+        ui.label(RichText::new("(empty)").monospace().size(11.0).color(DIM));
+    } else {
+        // header
+        ui.label(
+            RichText::new("  ADDR    +0   +1   +2   +3   +4   +5   +6   +7")
+                .monospace().size(10.5).color(START_GREEN_DIM),
+        );
+        ui.add_space(2.0);
+
+        let row_width = 8usize;
+        let start_addr = stack_top as usize;
+        let end_addr   = ramend as usize + 1;
+        let first_row  = start_addr / row_width;
+        let last_row   = (end_addr - 1) / row_width;
+
+        for row in first_row..=last_row {
+            let row_base = row * row_width;
+            let sp_row = sp >= row_base as u16 && (sp as usize) < row_base + row_width
+                         && sp >= 0x0100;
+            let color_row = if sp_row { AMBER } else { START_GREEN };
+
+            let mut line = format!("  0x{row_base:04X}  ");
+            let mut has_content = false;
+            for col in 0..row_width {
+                let addr = row_base + col;
+                if addr < 0x0100 || addr > ramend as usize {
+                    line.push_str("     ");
+                    continue;
+                }
+                if addr < start_addr {
+                    line.push_str("  .. ");
+                    continue;
+                }
+                    let b = cpu.sram[addr - 0x0100];
+                    let is_sp = addr as u16 == sp;
+                if is_sp {
+                    line.push_str(&format!("[{b:02X}] "));
+                } else {
+                    line.push_str(&format!(" {b:02X}  "));
+                }
+                has_content = true;
+            }
+            if has_content {
+                ui.label(RichText::new(line).monospace().size(10.5).color(color_row));
+            }
+        }
+    }
+
+    // stack_frames_popup
+    if s.popup_open {
+        let ctx = ui.ctx().clone();
+        Window::new("__stack_frames__")
+            .title_bar(false)
+            .frame(
+                Frame::NONE
+                    .fill(Color32::from_rgb(3, 8, 3))
+                    .stroke(Stroke::new(1.5, START_GREEN_DIM))
+                    .inner_margin(Margin::same(14)),
+            )
+            .fixed_size([480.0, 420.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(&ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("[ STACK FRAME ANALYSIS ]")
+                            .monospace().size(13.0).color(START_GREEN),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(RichText::new("✕").monospace().size(13.0).color(AMBER))
+                            .clicked()
+                        {
+                            s.popup_open = false;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Heuristic: 2-byte pairs that form a valid flash word address are marked as potential return addresses.")
+                        .monospace().size(10.0).color(DIM),
+                );
+                ui.add_space(6.0);
+
+                if depth == 0 || sp == 0 {
+                    ui.label(RichText::new("Stack is empty.").monospace().size(11.0).color(DIM));
+                    return;
+                }
+
+                ui.label(
+                    RichText::new(format!("{:<6} {:<6} {:<22} {}", "ADDR", "BYTES", "INTERPRETATION", "DISASM"))
+                        .monospace().size(11.0).color(START_GREEN_DIM),
+                );
+                ui.separator();
+
+                ScrollArea::vertical().id_salt("sf_scroll").max_height(300.0).show(ui, |ui| {
+                    let mut addr = stack_top as usize;
+                    while addr <= ramend as usize {
+                        if addr + 1 <= ramend as usize {
+                            // read 2-byte pair: AVR pushes PCH first (higher addr), PCL second (lower addr)
+                            // top of stack = SP+1 = PCL, SP+2 = PCH
+                            let lo = cpu.sram[addr     - 0x0100];
+                            let hi = cpu.sram[addr + 1 - 0x0100];
+                            let word_addr = (hi as u32) << 8 | lo as u32;
+
+                            if word_addr > 0
+                                && (word_addr as usize) < FLASH_WORDS
+                                && cpu.flash[word_addr as usize] != 0
+                            {
+                                // looks like a return address
+                                let disasm = cpu.disasm_at(word_addr);
+                                let cyc    = Cpu::instr_cycles_str(cpu.flash[word_addr as usize]);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "0x{addr:04X}  {lo:02X} {hi:02X}  → RET 0x{word_addr:04X}"
+                                        ))
+                                        .monospace().size(10.5).color(AMBER),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("  {disasm} [{cyc}cy]"))
+                                            .monospace().size(10.5).color(START_GREEN_DIM),
+                                    );
+                                });
+                                addr += 2;
+                                continue;
+                            }
+                        }
+                        // single byte (pushed variable or data)
+                let b = cpu.sram[addr - 0x0100];
+                let note = if b == 0 { " (zero)" } else { "" };
+                        ui.label(
+                            RichText::new(format!(
+                                "0x{addr:04X}  {b:02X}      PUSH'd byte  {b:3}{note}"
+                            ))
+                            .monospace().size(10.5).color(START_GREEN),
+                        );
+                        addr += 1;
+                    }
+                });
+            });
+    }
+
+    SimAction::None
 }
 
 // break tab

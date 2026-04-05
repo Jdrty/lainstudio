@@ -124,10 +124,10 @@ pub const ETIFR:  u16 = 0x007C; // Extended Timer Interrupt Flags
 
 pub const EICRA:  u16 = 0x006A; // Ext. Interrupt Control A
 
-pub const EEARL:  u16 = 0x0061; // EEPROM Address Low (alias, check datasheet)
-pub const EEARH:  u16 = 0x0062; // EEPROM Address High
-pub const EEDR:   u16 = 0x0060; // EEPROM Data Register
-pub const EECR:   u16 = 0x003F; // EEPROM Control (I/O 0x1F)
+pub const EEARH:  u16 = 0x003C; // I/O 0x1C EEPROM Address High
+pub const EEARL:  u16 = 0x003D; // I/O 0x1D EEPROM Address Low
+pub const EEDR:   u16 = 0x003E; // I/O 0x1E EEPROM Data Register
+pub const EECR:   u16 = 0x003F; // I/O 0x1F EEPROM Control Register
 
 // helpers
 
@@ -163,11 +163,14 @@ pub const IO_NAMES: &[(&str, u8)] = &[
     ("ACSR",   0x08),
     ("ADMUX",  0x07), ("ADCSRA", 0x06), ("ADCH",   0x05), ("ADCL",   0x04),
 
-    // rampz
-    ("RAMPZ",  0x1C),
-
-    // eecr_io1f_sbi_ok
+    // eeprom (standard IO, all accessible via IN/OUT/SBI/SBIC)
     ("EECR",   0x1F),
+    ("EEDR",   0x1E),
+    ("EEARL",  0x1D),
+    ("EEARH",  0x1C),
+
+    // rampz at correct ATmega128A address (I/O 0x3B)
+    ("RAMPZ",  0x3B),
 
     // wdt
     ("WDTCR",  0x21),

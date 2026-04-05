@@ -35,9 +35,15 @@ pub struct Cpu {
     pub sp:     u16,
     pub io:     [u8; IO_SIZE],
     pub sram:   Vec<u8>,
+    /// xmem: external SRAM mapped at 0x1100+; empty means XMEM is disabled
+    pub xmem:   Vec<u8>,
+    /// eeprom: 4 KB non-volatile storage, persists across reset
+    pub eeprom: Vec<u8>,
     pub cycles: u64,
     /// cycles_snapshot_when_timers_last_ticked
     timer_last_cycles: u64,
+    /// eemwe auto-clear countdown: EEMWE clears after 4 instructions if EEWE not triggered
+    eemwe_timer: u8,
 }
 
 impl Default for Cpu { fn default() -> Self { Self::new() } }
@@ -52,8 +58,11 @@ impl Cpu {
             sp:     0x10FF,
             io:     [0u8; IO_SIZE],
             sram:   vec![0u8; SRAM_BYTES],
+            xmem:   Vec::new(),
+            eeprom: vec![0xFFu8; 4096], // unprogrammed EEPROM = 0xFF
             cycles: 0,
             timer_last_cycles: 0,
+            eemwe_timer: 0,
         }
     }
 
@@ -64,8 +73,21 @@ impl Cpu {
         self.sp                = 0x10FF;
         self.io                = [0u8; IO_SIZE];
         self.sram              = vec![0u8; SRAM_BYTES];
+        self.xmem.fill(0);   // clear content, preserve size
+        // eeprom intentionally NOT reset — non-volatile storage survives reset
         self.cycles            = 0;
         self.timer_last_cycles = 0;
+        self.eemwe_timer       = 0;
+    }
+
+    /// Resize external SRAM. `size == 0` disables XMEM.
+    pub fn configure_xmem(&mut self, size: u32) {
+        let sz = size as usize;
+        if sz == 0 {
+            self.xmem.clear();
+        } else {
+            self.xmem.resize(sz, 0);
+        }
     }
 
     pub fn load_flash(&mut self, words: &[u16]) {
@@ -83,10 +105,16 @@ impl Cpu {
                 io_map::SPL  => self.sp as u8,
                 io_map::SPH  => (self.sp >> 8) as u8,
                 io_map::SREG => self.sreg,
+                // EEDR read: return eeprom data register (normal io read)
                 _            => self.io[(addr - 0x0020) as usize],
             },
             0x0100..=0x10FF => self.sram[(addr - 0x0100) as usize],
-            _               => 0,
+            _ => {
+                let off = (addr as usize).wrapping_sub(0x1100);
+                if !self.xmem.is_empty() && off < self.xmem.len() {
+                    self.xmem[off]
+                } else { 0 }
+            }
         }
     }
 
@@ -97,13 +125,71 @@ impl Cpu {
                 io_map::SPL  => self.sp = (self.sp & 0xFF00) | val as u16,
                 io_map::SPH  => self.sp = (self.sp & 0x00FF) | ((val as u16) << 8),
                 io_map::SREG => self.sreg = val,
-                // tifr_write_1_clears_flag
-                io_map::TIFR => self.io[(io_map::TIFR - 0x0020) as usize] &= !val,
-                _            => self.io[(addr - 0x0020) as usize] = val,
+                // tifr/etifr: write 1 clears flag
+                io_map::TIFR  => self.io[(io_map::TIFR  - 0x0020) as usize] &= !val,
+                io_map::ETIFR => self.io[(io_map::ETIFR - 0x0020) as usize] &= !val,
+                // eecr: hardware peripheral intercept
+                io_map::EECR  => self.eecr_write(val),
+                _             => self.io[(addr - 0x0020) as usize] = val,
             },
             0x0100..=0x10FF => self.sram[(addr - 0x0100) as usize] = val,
-            _               => {},
+            _ => {
+                let off = (addr as usize).wrapping_sub(0x1100);
+                if !self.xmem.is_empty() && off < self.xmem.len() {
+                    self.xmem[off] = val;
+                }
+            }
         }
+    }
+
+    // eeprom_peripheral
+
+    /// Handle a write to the EECR register, emulating the ATmega128A EEPROM controller.
+    fn eecr_write(&mut self, val: u8) {
+        let idx = (io_map::EECR - 0x0020) as usize;
+        let old = self.io[idx];
+
+        // EERE (bit 0): read trigger — fills EEDR from EEPROM, self-clears immediately
+        if val & 0x01 != 0 {
+            let addr = self.eear_addr();
+            let data = self.eeprom.get(addr).copied().unwrap_or(0xFF);
+            self.io[(io_map::EEDR - 0x0020) as usize] = data;
+            // store EECR without EERE (self-clearing)
+            self.io[idx] = val & !0x01;
+            return;
+        }
+
+        // EEWE (bit 1): write trigger — executes write then hardware clears EEWE + EEMWE
+        if val & 0x02 != 0 {
+            // EEMWE (bit 2) must be set in either the new value or the current register
+            let eemwe_set = (val | old) & 0x04 != 0;
+            if eemwe_set {
+                let addr = self.eear_addr();
+                let data = self.io[(io_map::EEDR - 0x0020) as usize];
+                if addr < self.eeprom.len() {
+                    self.eeprom[addr] = data;
+                }
+            }
+            // Hardware clears EEWE and EEMWE after write completes
+            self.io[idx] = val & !0x06;
+            self.eemwe_timer = 0;
+            return;
+        }
+
+        // EEMWE (bit 2): master write enable, auto-clears after 4 instructions
+        if val & 0x04 != 0 && old & 0x04 == 0 {
+            self.eemwe_timer = 4;
+        }
+
+        self.io[idx] = val & !0x01; // EERE never persists
+    }
+
+    /// Read EEAR (EEARH:EEARL) as a usize EEPROM address.
+    #[inline(always)]
+    fn eear_addr(&self) -> usize {
+        let lo = self.io[(io_map::EEARL - 0x0020) as usize] as usize;
+        let hi = self.io[(io_map::EEARH - 0x0020) as usize] as usize;
+        lo | (hi << 8)
     }
 
     // reg_pair_helpers
@@ -330,12 +416,20 @@ impl Cpu {
     // hardware_timers
     /// tick_timers: catch_up_cycles since last call (each step + run_timed batches)
     pub fn tick_timers(&mut self) {
+        // eemwe auto-clear: EEMWE clears 4 instructions after being set if EEWE not triggered
+        if self.eemwe_timer > 0 {
+            self.eemwe_timer -= 1;
+            if self.eemwe_timer == 0 {
+                self.io[(io_map::EECR - 0x0020) as usize] &= !0x04;
+            }
+        }
         let elapsed = self.cycles.wrapping_sub(self.timer_last_cycles);
         if elapsed == 0 { return; }
         self.timer_last_cycles = self.cycles;
         Self::tick_t0(&mut self.io, elapsed);
         Self::tick_t1(&mut self.io, elapsed);
         Self::tick_t2(&mut self.io, elapsed);
+        Self::tick_t3(&mut self.io, elapsed);
     }
 
     // data_addr_to_io_index
@@ -467,6 +561,71 @@ impl Cpu {
             }
             if (tcnt <= ocr && new_raw > ocr) || new_raw >= 256 {
                 io[Self::ii(io_map::TIFR)] |= 0x80; // ocf2
+            }
+        }
+    }
+
+
+    // timer3_16bit same_as_t1_with_c_channel
+    // etifr tov3=4 ocf3a=3 ocf3b=2 ocf3c=1
+    // tccr3b cs3 wgm32 ctc_ocr3a
+    fn tick_t3(io: &mut [u8; IO_SIZE], elapsed: u64) {
+        let tccr3b = io[Self::ii(io_map::TCCR3B)];
+        let div: u64 = match tccr3b & 0x07 {
+            1 => 1, 2 => 8, 3 => 64, 4 => 256, 5 => 1024,
+            _ => return,
+        };
+        let ticks = elapsed / div;
+        if ticks == 0 { return; }
+
+        let ctc = (tccr3b & 0x08) != 0; // wgm32 ctc_top_ocr3a
+
+        let tcnt = {
+            let lo = io[Self::ii(io_map::TCNT3L)] as u64;
+            let hi = io[Self::ii(io_map::TCNT3H)] as u64;
+            (hi << 8) | lo
+        };
+        let ocr3a = {
+            let lo = io[Self::ii(io_map::OCR3AL)] as u64;
+            let hi = io[Self::ii(io_map::OCR3AH)] as u64;
+            (hi << 8) | lo
+        };
+        let ocr3b = {
+            let lo = io[Self::ii(io_map::OCR3BL)] as u64;
+            let hi = io[Self::ii(io_map::OCR3BH)] as u64;
+            (hi << 8) | lo
+        };
+        let ocr3c = {
+            let lo = io[Self::ii(io_map::OCR3CL)] as u64;
+            let hi = io[Self::ii(io_map::OCR3CH)] as u64;
+            (hi << 8) | lo
+        };
+
+        if ctc {
+            let period  = (ocr3a + 1).max(1);
+            let new_raw = tcnt + ticks;
+            let new16   = (new_raw % period) as u16;
+            io[Self::ii(io_map::TCNT3L)] = new16 as u8;
+            io[Self::ii(io_map::TCNT3H)] = (new16 >> 8) as u8;
+            if new_raw >= period {
+                io[Self::ii(io_map::ETIFR)] |= 0x08; // ocf3a
+            }
+        } else {
+            let new_raw = tcnt + ticks;
+            let new16   = (new_raw % 65536) as u16;
+            io[Self::ii(io_map::TCNT3L)] = new16 as u8;
+            io[Self::ii(io_map::TCNT3H)] = (new16 >> 8) as u8;
+            if new_raw >= 65536 {
+                io[Self::ii(io_map::ETIFR)] |= 0x10; // tov3
+            }
+            if (tcnt <= ocr3a && new_raw > ocr3a) || new_raw >= 65536 {
+                io[Self::ii(io_map::ETIFR)] |= 0x08; // ocf3a
+            }
+            if (tcnt <= ocr3b && new_raw > ocr3b) || new_raw >= 65536 {
+                io[Self::ii(io_map::ETIFR)] |= 0x04; // ocf3b
+            }
+            if (tcnt <= ocr3c && new_raw > ocr3c) || new_raw >= 65536 {
+                io[Self::ii(io_map::ETIFR)] |= 0x02; // ocf3c
             }
         }
     }
@@ -1073,6 +1232,90 @@ impl Cpu {
 
     /// Returns the number of 16-bit words consumed by the instruction with the given opcode.
     /// The only 2-word instructions in AVR are JMP, CALL, LDS, and STS.
+    /// Returns (min_cycles, max_cycles) for the given 16-bit opcode.
+    /// Variable-cycle instructions (branches, skips) return different min and max.
+    pub fn instr_cycles(op: u16) -> (u8, u8) {
+        let hi8 = (op >> 8) as u8;
+        match op >> 12 {
+            0x0 => {
+                if op == 0x0000    { (1, 1) }
+                else if hi8 == 0x01 { (1, 1) }  // MOVW
+                else if hi8 == 0x02 { (2, 2) }  // MULS
+                else if hi8 == 0x03 { (2, 2) }  // MULSU / FMUL*
+                else                { (1, 1) }  // CPC, SBC, ADD/LSL
+            }
+            0x1 => {
+                if op & 0xFC00 == 0x1000 { (1, 3) }  // CPSE: 1/2/3
+                else                     { (1, 1) }  // CP, SBC, ADD/ADC
+            }
+            0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x7 => (1, 1),
+            0x8 | 0xA => (2, 2),
+            0x9 => {
+                // specific full-word matches first
+                if op == 0x9508 { return (4, 4); }  // RET
+                if op == 0x9518 { return (4, 4); }  // RETI
+                if op == 0x9509 { return (3, 3); }  // ICALL (ATmega128A: 3 cycles)
+                if op == 0x9519 { return (4, 4); }  // EICALL
+                if op == 0x9409 { return (2, 2); }  // IJMP
+                if op == 0x9419 { return (2, 2); }  // EIJMP
+                if op == 0x95C8 { return (3, 3); }  // LPM R0,Z
+                if op == 0x95D8 { return (3, 3); }  // ELPM R0,Z
+                // JMP / CALL (2-word)
+                if op & 0xFE0E == 0x940C { return (3, 3); }
+                if op & 0xFE0E == 0x940E { return (4, 4); }
+                // LPM Rd,Z / LPM Rd,Z+  (lo nibble 4/5, hi byte ≤ 0x91)
+                let lo4 = (op & 0xF) as u8;
+                if (lo4 == 4 || lo4 == 5) && hi8 <= 0x91 { return (3, 3); }
+                // ELPM Rd,Z / ELPM Rd,Z+
+                if (lo4 == 6 || lo4 == 7) && hi8 <= 0x91 { return (3, 3); }
+                // ADIW / SBIW
+                if hi8 == 0x96 || hi8 == 0x97 { return (2, 2); }
+                // CBI / SBI
+                if hi8 == 0x98 || hi8 == 0x9A { return (2, 2); }
+                // SBIC / SBIS: 2 not-taken, 3 taken, 4 skip 2-word
+                if hi8 == 0x99 || hi8 == 0x9B { return (2, 4); }
+                // MUL family (0x9Cxx–0x9Fxx)
+                if hi8 >= 0x9C { return (2, 2); }
+                // 0x94xx / 0x95xx: single-reg ops (COM, NEG, SWAP, INC, DEC, ASR, LSR,
+                //                  ROR, BSET/BCLR, SLEEP, WDR, BREAK, SPM)
+                if hi8 == 0x94 || hi8 == 0x95 { return (1, 1); }
+                // Everything else: LD/ST/POP/PUSH with various addressing modes
+                (2, 2)
+            }
+            0xB => (1, 1),  // IN / OUT
+            0xC => (2, 2),  // RJMP
+            0xD => (3, 3),  // RCALL
+            0xE => (1, 1),  // LDI
+            0xF => {
+                if op < 0xF800 { (1, 2) }  // BRBS / BRBC
+                else if op < 0xFC00 { (1, 1) }  // BLD / BST
+                else { (1, 3) }  // SBRC / SBRS
+            }
+            _ => (1, 1),
+        }
+    }
+
+    pub fn instr_cycles_str(op: u16) -> &'static str {
+        match Self::instr_cycles(op) {
+            (1, 1) => "1",
+            (2, 2) => "2",
+            (3, 3) => "3",
+            (4, 4) => "4",
+            (1, 2) => "1/2",
+            (1, 3) => "1/2/3",
+            (2, 4) => "2/3/4",
+            _      => "?",
+        }
+    }
+
+    /// Directly set bits in an IO register by data-space address (bypasses write-to-clear).
+    pub fn set_io_bit(&mut self, data_addr: u16, mask: u8) {
+        let idx = (data_addr as usize).wrapping_sub(0x0020);
+        if idx < self.io.len() {
+            self.io[idx] |= mask;
+        }
+    }
+
     pub fn instr_words(op: u16) -> usize {
         if (op & 0xFE0E) == 0x940C { return 2; } // JMP
         if (op & 0xFE0E) == 0x940E { return 2; } // CALL
