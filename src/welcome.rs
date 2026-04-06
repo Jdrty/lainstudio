@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId, Image, RichText, Stroke, StrokeKind, Ui, Vec2};
 
+use crate::avr::McuModel;
 use crate::welcome_font;
 
 pub const START_GREEN: Color32 = Color32::from_rgb(0x0b, 0xca, 0x0b);
@@ -321,6 +322,7 @@ pub fn show_create_project(
     ui: &mut Ui,
     parent_dir: &Option<std::path::PathBuf>,
     name: &mut String,
+    model: &mut McuModel,
     err: &Option<String>,
 ) -> CreateProjectAction {
     let mut action = CreateProjectAction::None;
@@ -363,6 +365,22 @@ pub fn show_create_project(
         )
     }
 
+    fn green_toggle_button(ui: &mut Ui, label: &str, selected: bool, font_px: f32) -> egui::Response {
+        ui.add(
+            egui::Button::new(
+                RichText::new(label)
+                    .color(if selected { Color32::BLACK } else { START_GREEN })
+                    .font(FontId::monospace(font_px)),
+            )
+            .fill(if selected {
+                START_GREEN
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(Stroke::new(1.0, START_GREEN)),
+        )
+    }
+
     ui.vertical_centered(|ui| {
         ui.add_space(MARGIN);
         ui.label(
@@ -395,6 +413,22 @@ pub fn show_create_project(
         }
 
         ui.add_space(sp(16.0));
+        ui.label(
+            RichText::new("TARGET MCU")
+                .font(title_font(label_px))
+                .color(START_GREEN_DIM)
+                .extra_letter_spacing(letter_sp),
+        );
+        ui.horizontal(|ui| {
+            if green_toggle_button(ui, "ATmega328P", *model == McuModel::Atmega328P, button_px).clicked() {
+                *model = McuModel::Atmega328P;
+            }
+            if green_toggle_button(ui, "ATmega128A", *model == McuModel::Atmega128A, button_px).clicked() {
+                *model = McuModel::Atmega128A;
+            }
+        });
+
+        ui.add_space(sp(12.0));
         ui.label(
             RichText::new("NAME")
                 .font(title_font(label_px))

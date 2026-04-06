@@ -3,7 +3,7 @@
 use eframe::egui::{
     self, Align, Button, Color32, Frame, Grid, Layout, Margin, RichText, ScrollArea, Stroke, Ui,
 };
-use crate::avr::cpu::{Cpu, FLASH_WORDS};
+use crate::avr::cpu::Cpu;
 use crate::welcome::{START_GREEN, START_GREEN_DIM};
 
 const AMBER:   Color32 = Color32::from_rgb(255, 185, 55);
@@ -35,7 +35,7 @@ pub fn show_flash_locations_window(ctx: &egui::Context, open: &mut bool, cpu: &C
             // title_bar
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("[ FLASH LOCATIONS — ATmega128A ]")
+                    RichText::new(format!("[ FLASH LOCATIONS — {} ]", cpu.model.label()))
                         .monospace().size(16.0).color(START_GREEN),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -62,53 +62,15 @@ pub fn show_flash_locations_window(ctx: &egui::Context, open: &mut bool, cpu: &C
         });
 }
 
-// ivt_layout
-const IVT: &[(u32, &str)] = &[
-    (0x0000, "RESET"),
-    (0x0002, "INT0"),
-    (0x0004, "INT1"),
-    (0x0006, "INT2"),
-    (0x0008, "INT3"),
-    (0x000A, "INT4"),
-    (0x000C, "INT5"),
-    (0x000E, "INT6"),
-    (0x0010, "INT7"),
-    (0x0012, "TIMER2_COMP"),
-    (0x0014, "TIMER2_OVF"),
-    (0x0016, "TIMER1_CAPT"),
-    (0x0018, "TIMER1_COMPA"),
-    (0x001A, "TIMER1_COMPB"),
-    (0x001C, "TIMER1_OVF"),
-    (0x001E, "TIMER0_COMP"),
-    (0x0020, "TIMER0_OVF"),
-    (0x0022, "SPI_STC"),
-    (0x0024, "USART0_RX"),
-    (0x0026, "USART0_UDRE"),
-    (0x0028, "USART0_TX"),
-    (0x002A, "ADC"),
-    (0x002C, "EE_RDY"),
-    (0x002E, "ANA_COMP"),
-    (0x0030, "TIMER1_COMPC"),
-    (0x0032, "TIMER3_CAPT"),
-    (0x0034, "TIMER3_COMPA"),
-    (0x0036, "TIMER3_COMPB"),
-    (0x0038, "TIMER3_COMPC"),
-    (0x003A, "TIMER3_OVF"),
-    (0x003C, "USART1_RX"),
-    (0x003E, "USART1_UDRE"),
-    (0x0040, "USART1_TX"),
-    (0x0042, "TWI"),
-    (0x0044, "SPM_RDY"),
-];
-
 fn vector_content(cpu: &Cpu, addr: u32) -> (String, bool) {
-    let op = if (addr as usize) < FLASH_WORDS { cpu.flash[addr as usize] } else { 0 };
+    let flash_words = cpu.flash_words();
+    let op = if (addr as usize) < flash_words { cpu.flash[addr as usize] } else { 0 };
     if op == 0x0000 {
         return ("EMPTY".to_string(), false);
     }
     // JMP: 1001 010k kkkk 110k  (any k)
     if (op & 0xFE0E) == 0x940C {
-        let next = if (addr as usize + 1) < FLASH_WORDS { cpu.flash[addr as usize + 1] } else { 0 };
+        let next = if (addr as usize + 1) < flash_words { cpu.flash[addr as usize + 1] } else { 0 };
         let target = (((op & 0x01F0) as u32) << 17)
                    | (((op & 0x0001) as u32) << 16)
                    | (next as u32);
@@ -127,8 +89,10 @@ fn vector_content(cpu: &Cpu, addr: u32) -> (String, bool) {
 }
 
 fn show_ivt_section(ui: &mut Ui, cpu: &Cpu) {
+    let ivt_end_word = cpu.ivt_end_word();
+    let ivt_end_byte = ivt_end_word * 2;
     ui.label(
-        RichText::new("INTERRUPT VECTOR TABLE  (0x0000 – 0x0044, 2 words each)")
+        RichText::new(format!("INTERRUPT VECTOR TABLE  (0x0000 – 0x{ivt_end_byte:04X}, byte addresses)"))
             .monospace().size(12.5).color(SEC_COL),
     );
     ui.add_space(4.0);
@@ -145,13 +109,15 @@ fn show_ivt_section(ui: &mut Ui, cpu: &Cpu) {
         .num_columns(3)
         .spacing([10.0, 2.0])
         .show(ui, |ui| {
-            for &(addr, name) in IVT {
+            for addr in 0..=ivt_end_word {
+                let Some(name) = cpu.ivt_name(addr) else { continue; };
                 let (content, occupied) = vector_content(cpu, addr);
                 let name_col = if occupied { AMBER } else { DIM };
                 let cont_col = if occupied { START_GREEN } else { DIM };
+                let addr_byte = addr * 2;
 
                 ui.label(
-                    RichText::new(format!("  0x{addr:04X}"))
+                    RichText::new(format!("  0x{addr_byte:04X}"))
                         .monospace().size(11.5).color(START_GREEN_DIM),
                 );
                 ui.label(
@@ -167,27 +133,35 @@ fn show_ivt_section(ui: &mut Ui, cpu: &Cpu) {
 
     ui.add_space(4.0);
     ui.label(
-        RichText::new("  Code area begins at 0x0046 (first word after IVT)")
+        RichText::new(format!(
+            "  Code area begins at 0x{:04X} (byte address), first word after IVT",
+            (ivt_end_word + 1) * 2
+        ))
             .monospace().size(11.0).color(DIM),
     );
 }
 
 fn show_code_regions_section(ui: &mut Ui, cpu: &Cpu) {
+    let ivt_end_word = cpu.ivt_end_word();
+    let ivt_end_byte = ivt_end_word * 2;
     ui.label(
-        RichText::new("CODE REGIONS  (non-empty flash words beyond 0x0045)")
+        RichText::new(format!(
+            "CODE REGIONS  (non-empty flash words beyond IVT end 0x{ivt_end_byte:04X} bytes)"
+        ))
             .monospace().size(12.5).color(SEC_COL),
     );
     ui.add_space(4.0);
 
-    // Walk flash from 0x0046 and collect contiguous occupied regions
-    let start_scan = 0x0046_usize;
+    // Walk flash starting at first word past the model-specific IVT.
+    let start_scan = (ivt_end_word as usize).saturating_add(1);
     let mut regions: Vec<(u32, u32, u32)> = Vec::new(); // (start, end_excl, words)
     let mut in_region = false;
     let mut reg_start = 0u32;
     let mut reg_words = 0u32;
 
     let mut a = start_scan;
-    while a < FLASH_WORDS {
+    let flash_words = cpu.flash_words();
+    while a < flash_words {
         let op = cpu.flash[a];
         if op != 0 {
             if !in_region { reg_start = a as u32; reg_words = 0; in_region = true; }

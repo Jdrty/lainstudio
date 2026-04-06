@@ -5,11 +5,16 @@
 //! run_timed: 100k_step batches, one Instant::now per batch
 //! .
 
-use super::io_map;
+use super::{io_map, McuModel};
 
 pub const FLASH_WORDS: usize = 65_536;
-const SRAM_BYTES:  usize = 4_096;
-const IO_SIZE:     usize = 0x00E0; // data_mem 0x0020–0x00FF
+pub const FLASH_WORDS_128A: usize = 65_536;
+pub const FLASH_WORDS_328P: usize = 16_384;
+const SRAM_BYTES_128A: usize = 4_096;
+const SRAM_BYTES_328P: usize = 2_048;
+const IO_SIZE: usize = 0x00E0; // data_mem 0x0020–0x00FF
+const EEPROM_BYTES_128A: usize = 4_096;
+const EEPROM_BYTES_328P: usize = 1_024;
 
 // sreg_bit_indices
 pub const SREG_C: u8 = 0;
@@ -28,6 +33,7 @@ pub enum StepResult { Ok, Halted, UnknownOpcode(u16) }
 // cpu
 #[derive(Clone)]
 pub struct Cpu {
+    pub model:  McuModel,
     pub flash:  Vec<u16>,
     pub regs:   [u8; 32],
     pub pc:     u32,
@@ -37,7 +43,7 @@ pub struct Cpu {
     pub sram:   Vec<u8>,
     /// xmem: external SRAM mapped at 0x1100+; empty means XMEM is disabled
     pub xmem:   Vec<u8>,
-    /// eeprom: 4 KB non-volatile storage, persists across reset
+    /// eeprom non-volatile storage, persists across reset
     pub eeprom: Vec<u8>,
     pub cycles: u64,
     /// cycles_snapshot_when_timers_last_ticked
@@ -50,29 +56,81 @@ impl Default for Cpu { fn default() -> Self { Self::new() } }
 
 impl Cpu {
     pub fn new() -> Self {
+        Self::new_for_model(McuModel::Atmega128A)
+    }
+
+    pub fn new_for_model(model: McuModel) -> Self {
+        let (sram_bytes, eeprom_bytes, ram_end) = match model {
+            McuModel::Atmega128A => (SRAM_BYTES_128A, EEPROM_BYTES_128A, 0x10FFu16),
+            McuModel::Atmega328P => (SRAM_BYTES_328P, EEPROM_BYTES_328P, 0x08FFu16),
+        };
         Self {
+            model,
             flash:  vec![0u16; FLASH_WORDS],
             regs:   [0u8; 32],
             pc:     0,
             sreg:   0,
-            sp:     0x10FF,
+            sp:     ram_end,
             io:     [0u8; IO_SIZE],
-            sram:   vec![0u8; SRAM_BYTES],
+            sram:   vec![0u8; sram_bytes],
             xmem:   Vec::new(),
-            eeprom: vec![0xFFu8; 4096], // unprogrammed EEPROM = 0xFF
+            eeprom: vec![0xFFu8; eeprom_bytes], // unprogrammed EEPROM = 0xFF
             cycles: 0,
             timer_last_cycles: 0,
             eemwe_timer: 0,
         }
     }
 
+
+
+    #[inline(always)]
+    pub fn flash_words(&self) -> usize {
+        match self.model {
+            McuModel::Atmega128A => FLASH_WORDS_128A,
+            McuModel::Atmega328P => FLASH_WORDS_328P,
+        }
+    }
+
+    #[inline(always)]
+    pub fn ram_start(&self) -> u16 { 0x0100 }
+
+    #[inline(always)]
+    pub fn ram_end(&self) -> u16 {
+        self.ram_start() + self.sram.len() as u16 - 1
+    }
+
+    #[inline(always)]
+    pub fn xmem_base(&self) -> u16 {
+        self.ram_end().wrapping_add(1)
+    }
+
+    #[inline(always)]
+    pub fn has_xmem(&self) -> bool {
+        matches!(self.model, McuModel::Atmega128A)
+    }
+
+    #[inline(always)]
+    pub fn has_timer3(&self) -> bool {
+        matches!(self.model, McuModel::Atmega128A)
+    }
+
+    pub fn gpio_ports(&self) -> &'static [(&'static str, u16, u16, u16)] {
+        match self.model {
+            McuModel::Atmega128A => &io_map::PORTS,
+            McuModel::Atmega328P => &[
+                ("B", io_map::PORTB, io_map::DDRB, io_map::PINB),
+                ("C", io_map::PORTC, io_map::DDRC, io_map::PINC),
+                ("D", io_map::PORTD, io_map::DDRD, io_map::PIND),
+            ],
+        }
+    }
     pub fn reset(&mut self) {
         self.regs              = [0u8; 32];
         self.pc                = 0;
         self.sreg              = 0;
-        self.sp                = 0x10FF;
+        self.sp                = self.ram_end();
         self.io                = [0u8; IO_SIZE];
-        self.sram              = vec![0u8; SRAM_BYTES];
+        self.sram              = vec![0u8; self.sram.len()];
         self.xmem.fill(0);   // clear content, preserve size
         // eeprom intentionally NOT reset — non-volatile storage survives reset
         self.cycles            = 0;
@@ -82,6 +140,10 @@ impl Cpu {
 
     /// Resize external SRAM. `size == 0` disables XMEM.
     pub fn configure_xmem(&mut self, size: u32) {
+        if !self.has_xmem() {
+            self.xmem.clear();
+            return;
+        }
         let sz = size as usize;
         if sz == 0 {
             self.xmem.clear();
@@ -91,7 +153,7 @@ impl Cpu {
     }
 
     pub fn load_flash(&mut self, words: &[u16]) {
-        let n = words.len().min(FLASH_WORDS);
+        let n = words.len().min(self.flash_words());
         self.flash[..n].copy_from_slice(&words[..n]);
         self.flash[n..].fill(0);
     }
@@ -105,15 +167,21 @@ impl Cpu {
                 io_map::SPL  => self.sp as u8,
                 io_map::SPH  => (self.sp >> 8) as u8,
                 io_map::SREG => self.sreg,
-                // EEDR read: return eeprom data register (normal io read)
                 _            => self.io[(addr - 0x0020) as usize],
             },
-            0x0100..=0x10FF => self.sram[(addr - 0x0100) as usize],
             _ => {
-                let off = (addr as usize).wrapping_sub(0x1100);
-                if !self.xmem.is_empty() && off < self.xmem.len() {
+                let ram_start = self.ram_start();
+                let ram_end = self.ram_end();
+                if addr >= ram_start && addr <= ram_end {
+                    return self.sram[(addr - ram_start) as usize];
+                }
+                let xmem_base = self.xmem_base() as usize;
+                let off = (addr as usize).wrapping_sub(xmem_base);
+                if self.has_xmem() && !self.xmem.is_empty() && off < self.xmem.len() {
                     self.xmem[off]
-                } else { 0 }
+                } else {
+                    0
+                }
             }
         }
     }
@@ -125,17 +193,21 @@ impl Cpu {
                 io_map::SPL  => self.sp = (self.sp & 0xFF00) | val as u16,
                 io_map::SPH  => self.sp = (self.sp & 0x00FF) | ((val as u16) << 8),
                 io_map::SREG => self.sreg = val,
-                // tifr/etifr: write 1 clears flag
-                io_map::TIFR  => self.io[(io_map::TIFR  - 0x0020) as usize] &= !val,
+                io_map::TIFR  => self.io[(io_map::TIFR - 0x0020) as usize] &= !val,
                 io_map::ETIFR => self.io[(io_map::ETIFR - 0x0020) as usize] &= !val,
-                // eecr: hardware peripheral intercept
                 io_map::EECR  => self.eecr_write(val),
                 _             => self.io[(addr - 0x0020) as usize] = val,
             },
-            0x0100..=0x10FF => self.sram[(addr - 0x0100) as usize] = val,
             _ => {
-                let off = (addr as usize).wrapping_sub(0x1100);
-                if !self.xmem.is_empty() && off < self.xmem.len() {
+                let ram_start = self.ram_start();
+                let ram_end = self.ram_end();
+                if addr >= ram_start && addr <= ram_end {
+                    self.sram[(addr - ram_start) as usize] = val;
+                    return;
+                }
+                let xmem_base = self.xmem_base() as usize;
+                let off = (addr as usize).wrapping_sub(xmem_base);
+                if self.has_xmem() && !self.xmem.is_empty() && off < self.xmem.len() {
                     self.xmem[off] = val;
                 }
             }
@@ -269,7 +341,7 @@ impl Cpu {
 
     // public_step
     pub fn step(&mut self) -> StepResult {
-        if self.pc as usize >= FLASH_WORDS { return StepResult::Halted; }
+        if self.pc as usize >= self.flash_words() { return StepResult::Halted; }
         // safety: flash_bounds_ok
         let op = unsafe { *self.flash.get_unchecked(self.pc as usize) };
         self.pc += 1;
@@ -282,7 +354,7 @@ impl Cpu {
     pub fn step_n(&mut self, n: u32) -> (u32, StepResult) {
         let mut ran = 0u32;
         while ran < n {
-            if self.pc as usize >= FLASH_WORDS {
+            if self.pc as usize >= self.flash_words() {
                 return (ran, StepResult::Halted);
             }
             // safety: flash_bounds_ok
@@ -370,45 +442,79 @@ impl Cpu {
 
 
     // interrupt_vector_table
-    /// ivt_name flash_word_addr or none
-    pub fn ivt_name(addr: u32) -> Option<&'static str> {
-        match addr {
-            0x0000 => Some("RESET"),
-            0x0002 => Some("INT0"),
-            0x0004 => Some("INT1"),
-            0x0006 => Some("INT2"),
-            0x0008 => Some("INT3"),
-            0x000A => Some("INT4"),
-            0x000C => Some("INT5"),
-            0x000E => Some("INT6"),
-            0x0010 => Some("INT7"),
-            0x0012 => Some("TIMER2_COMP"),
-            0x0014 => Some("TIMER2_OVF"),
-            0x0016 => Some("TIMER1_CAPT"),
-            0x0018 => Some("TIMER1_COMPA"),
-            0x001A => Some("TIMER1_COMPB"),
-            0x001C => Some("TIMER1_OVF"),
-            0x001E => Some("TIMER0_COMP"),
-            0x0020 => Some("TIMER0_OVF"),
-            0x0022 => Some("SPI_STC"),
-            0x0024 => Some("USART0_RX"),
-            0x0026 => Some("USART0_UDRE"),
-            0x0028 => Some("USART0_TX"),
-            0x002A => Some("ADC"),
-            0x002C => Some("EE_RDY"),
-            0x002E => Some("ANA_COMP"),
-            0x0030 => Some("TIMER1_COMPC"),
-            0x0032 => Some("TIMER3_CAPT"),
-            0x0034 => Some("TIMER3_COMPA"),
-            0x0036 => Some("TIMER3_COMPB"),
-            0x0038 => Some("TIMER3_COMPC"),
-            0x003A => Some("TIMER3_OVF"),
-            0x003C => Some("USART1_RX"),
-            0x003E => Some("USART1_UDRE"),
-            0x0040 => Some("USART1_TX"),
-            0x0042 => Some("TWI"),
-            0x0044 => Some("SPM_RDY"),
-            _ => None,
+    /// ivt_name flash word address or none (model-specific layout).
+    pub fn ivt_name(&self, addr: u32) -> Option<&'static str> {
+        match self.model {
+            McuModel::Atmega128A => match addr {
+                0x0000 => Some("RESET"),
+                0x0002 => Some("INT0"),
+                0x0004 => Some("INT1"),
+                0x0006 => Some("INT2"),
+                0x0008 => Some("INT3"),
+                0x000A => Some("INT4"),
+                0x000C => Some("INT5"),
+                0x000E => Some("INT6"),
+                0x0010 => Some("INT7"),
+                0x0012 => Some("TIMER2_COMP"),
+                0x0014 => Some("TIMER2_OVF"),
+                0x0016 => Some("TIMER1_CAPT"),
+                0x0018 => Some("TIMER1_COMPA"),
+                0x001A => Some("TIMER1_COMPB"),
+                0x001C => Some("TIMER1_OVF"),
+                0x001E => Some("TIMER0_COMP"),
+                0x0020 => Some("TIMER0_OVF"),
+                0x0022 => Some("SPI_STC"),
+                0x0024 => Some("USART0_RX"),
+                0x0026 => Some("USART0_UDRE"),
+                0x0028 => Some("USART0_TX"),
+                0x002A => Some("ADC"),
+                0x002C => Some("EE_RDY"),
+                0x002E => Some("ANA_COMP"),
+                0x0030 => Some("TIMER1_COMPC"),
+                0x0032 => Some("TIMER3_CAPT"),
+                0x0034 => Some("TIMER3_COMPA"),
+                0x0036 => Some("TIMER3_COMPB"),
+                0x0038 => Some("TIMER3_COMPC"),
+                0x003A => Some("TIMER3_OVF"),
+                _ => None,
+            },
+            McuModel::Atmega328P => match addr {
+                0x0000 => Some("RESET"),
+                0x0001 => Some("INT0"),
+                0x0002 => Some("INT1"),
+                0x0003 => Some("PCINT0"),
+                0x0004 => Some("PCINT1"),
+                0x0005 => Some("PCINT2"),
+                0x0006 => Some("WDT"),
+                0x0007 => Some("TIMER2_COMPA"),
+                0x0008 => Some("TIMER2_COMPB"),
+                0x0009 => Some("TIMER2_OVF"),
+                0x000A => Some("TIMER1_CAPT"),
+                0x000B => Some("TIMER1_COMPA"),
+                0x000C => Some("TIMER1_COMPB"),
+                0x000D => Some("TIMER1_OVF"),
+                0x000E => Some("TIMER0_COMPA"),
+                0x000F => Some("TIMER0_COMPB"),
+                0x0010 => Some("TIMER0_OVF"),
+                0x0011 => Some("SPI_STC"),
+                0x0012 => Some("USART_RX"),
+                0x0013 => Some("USART_UDRE"),
+                0x0014 => Some("USART_TX"),
+                0x0015 => Some("ADC"),
+                0x0016 => Some("EE_READY"),
+                0x0017 => Some("ANALOG_COMP"),
+                0x0018 => Some("TWI"),
+                0x0019 => Some("SPM_READY"),
+                _ => None,
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub fn ivt_end_word(&self) -> u32 {
+        match self.model {
+            McuModel::Atmega128A => 0x003A, // byte 0x0074
+            McuModel::Atmega328P => 0x0019, // byte 0x0032
         }
     }
 
@@ -429,7 +535,9 @@ impl Cpu {
         Self::tick_t0(&mut self.io, elapsed);
         Self::tick_t1(&mut self.io, elapsed);
         Self::tick_t2(&mut self.io, elapsed);
-        Self::tick_t3(&mut self.io, elapsed);
+        if self.has_timer3() {
+            Self::tick_t3(&mut self.io, elapsed);
+        }
     }
 
     // data_addr_to_io_index
@@ -740,7 +848,7 @@ impl Cpu {
                     let (d,r) = (d!(), r!());
                     if self.regs[d] == self.regs[r] {
                         // safety: skip_target_bounds_in_step
-                        let next = if (self.pc as usize) < FLASH_WORDS {
+                        let next = if (self.pc as usize) < self.flash_words() {
                             unsafe { *self.flash.get_unchecked(self.pc as usize) }
                         } else { 0 };
                         let skip = if Self::is_2word(next) { 2 } else { 1 };
@@ -942,7 +1050,7 @@ impl Cpu {
                     let bit_val = (self.regs[r] >> b) & 1;
                     let want    = if op & 0x0200 == 0 { 0 } else { 1 };
                     if bit_val == want {
-                        let next = if (self.pc as usize) < FLASH_WORDS {
+                        let next = if (self.pc as usize) < self.flash_words() {
                             unsafe { *self.flash.get_unchecked(self.pc as usize) }
                         } else { 0 };
                         let skip = if Self::is_2word(next) { 2 } else { 1 };
@@ -968,7 +1076,7 @@ impl Cpu {
         0x0 | 0x1 => {
             match op & 0x0F {
                 0x0 => { // lds_k_2w
-                    if self.pc as usize >= FLASH_WORDS { return StepResult::Halted; }
+                    if self.pc as usize >= self.flash_words() { return StepResult::Halted; }
                     let k = unsafe { self.fetch_unchecked() } as u16;
                     self.regs[d] = self.read_mem(k);
                     self.cycles += 2;
@@ -1028,7 +1136,7 @@ impl Cpu {
             let r = d; // same_rd_field_as_ld
             match op & 0x0F {
                 0x0 => { // sts_k_2w
-                    if self.pc as usize >= FLASH_WORDS { return StepResult::Halted; }
+                    if self.pc as usize >= self.flash_words() { return StepResult::Halted; }
                     let k = unsafe { self.fetch_unchecked() } as u16;
                     let val = self.regs[r]; self.write_mem(k, val); self.cycles += 2;
                 }
@@ -1068,7 +1176,7 @@ impl Cpu {
                         self.cycles += 1;
                     // jmp_call_2w
                     } else if op & 0xFE0E == 0x940C {
-                        let k = if (self.pc as usize) < FLASH_WORDS {
+                        let k = if (self.pc as usize) < self.flash_words() {
                             (unsafe { self.fetch_unchecked() }) as u32
                         } else { return StepResult::Halted; };
                         if op & 0x0001 != 0 { // call
@@ -1187,7 +1295,7 @@ impl Cpu {
             let a=(op>>3)&0x1F; let b=op&7;
             let mem=io_map::io_to_mem(a as u8);
             if (self.read_mem(mem)>>b)&1==0 {
-                let next = if (self.pc as usize)<FLASH_WORDS { unsafe{*self.flash.get_unchecked(self.pc as usize)} } else {0};
+                let next = if (self.pc as usize) < self.flash_words() { unsafe{*self.flash.get_unchecked(self.pc as usize)} } else {0};
                 let skip=if Self::is_2word(next){2}else{1};
                 self.pc+=skip; self.cycles+=1+skip as u64;
             } else { self.cycles+=1; }
@@ -1205,7 +1313,7 @@ impl Cpu {
             let a=(op>>3)&0x1F; let b=op&7;
             let mem=io_map::io_to_mem(a as u8);
             if (self.read_mem(mem)>>b)&1==1 {
-                let next = if (self.pc as usize)<FLASH_WORDS { unsafe{*self.flash.get_unchecked(self.pc as usize)} } else {0};
+                let next = if (self.pc as usize) < self.flash_words() { unsafe{*self.flash.get_unchecked(self.pc as usize)} } else {0};
                 let skip=if Self::is_2word(next){2}else{1};
                 self.pc+=skip; self.cycles+=1+skip as u64;
             } else { self.cycles+=1; }
@@ -1324,9 +1432,9 @@ impl Cpu {
     }
 
     pub fn disasm_at(&self, addr: u32) -> String {
-        if addr as usize >= FLASH_WORDS { return "---".into(); }
+        if addr as usize >= self.flash_words() { return "---".into(); }
         let op   = self.flash[addr as usize];
-        let next = if addr as usize + 1 < FLASH_WORDS { self.flash[addr as usize + 1] } else { 0 };
+        let next = if addr as usize + 1 < self.flash_words() { self.flash[addr as usize + 1] } else { 0 };
 
         macro_rules! dr   { () => { (((op>>4)&0x1F), ((op>>5)&0x10)|(op&0x0F)) } }
         macro_rules! immd { () => { (((op>>4)&0x0F)+16, ((op>>4)&0xF0)|(op&0x0F)) } }

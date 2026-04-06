@@ -10,7 +10,8 @@ use eframe::egui::{
 };
 
 use crate::boot_video::BootVideo;
-use crate::avr::assembler::assemble;
+use crate::avr::McuModel;
+use crate::avr::assembler::assemble_for_model;
 use crate::avr::cpu::StepResult;
 use crate::avr::Cpu;
 use crate::editor::TextEditor;
@@ -103,6 +104,7 @@ pub fn setup_style(ctx: &egui::Context) {
 pub struct Workspace {
     pub root: PathBuf,
     pub active_file: Option<PathBuf>,
+    pub model: McuModel,
 }
 
 enum AppPhase {
@@ -110,6 +112,7 @@ enum AppPhase {
     CreateProject {
         parent_dir: Option<PathBuf>,
         name: String,
+        model: McuModel,
         err: Option<String>,
     },
     Editor {
@@ -303,13 +306,15 @@ impl LainApp {
                 self.set_error(err);
             }
         }
+        self.sim = Cpu::new_for_model(workspace.model);
         self.phase = AppPhase::Editor { workspace };
         self.modal = ModalState::None;
     }
 
     fn open_workspace(&mut self, root: PathBuf) {
+        let model = ensure_workspace_model_marker(&root).unwrap_or(McuModel::Atmega328P);
         let active_file = find_first_supported_file(&root);
-        self.enter_editor(Workspace { root, active_file });
+        self.enter_editor(Workspace { root, active_file, model });
         self.set_status("Opened folder.");
     }
 
@@ -759,6 +764,7 @@ impl eframe::App for LainApp {
                             self.phase = AppPhase::CreateProject {
                                 parent_dir: None,
                                 name: String::new(),
+                                model: McuModel::Atmega328P,
                                 err: None,
                             };
                         }
@@ -767,8 +773,9 @@ impl eframe::App for LainApp {
                     AppPhase::CreateProject {
                         parent_dir,
                         name,
+                        model,
                         err,
-                    } => match show_create_project(ui, parent_dir, name, err) {
+                    } => match show_create_project(ui, parent_dir, name, model, err) {
                         CreateProjectAction::PickParentFolder => {
                             if let Some(path) = rfd::FileDialog::new()
                                 .set_title("Choose parent folder")
@@ -784,11 +791,12 @@ impl eframe::App for LainApp {
                         CreateProjectAction::Submit => {
                             *err = None;
                             if let Some(parent) = parent_dir.clone() {
-                                match try_create_lain_project(&parent, name) {
-                                    Ok((root, lain_path)) => {
+                                match try_create_lain_project(&parent, name, *model) {
+                                    Ok((root, lain_path, model)) => {
                                         self.enter_editor(Workspace {
                                             root,
                                             active_file: Some(lain_path),
+                                            model,
                                         });
                                         self.set_status("Created project.");
                                     }
@@ -832,7 +840,8 @@ impl eframe::App for LainApp {
             SimAction::None => {}
             SimAction::Assemble => {
                 let source = self.editor.source().to_owned();
-                match assemble(&source) {
+                let model = self.current_workspace().map(|w| w.model).unwrap_or(McuModel::Atmega128A);
+                match assemble_for_model(&source, model) {
                     Ok(words) => {
                         let n = words.len();
                         self.sim.reset();
@@ -1016,7 +1025,7 @@ fn find_first_supported_file(root: &Path) -> Option<PathBuf> {
 }
 
 /// mkdir_project parent_name_lainfile
-fn try_create_lain_project(parent: &Path, name: &str) -> Result<(PathBuf, PathBuf), String> {
+fn try_create_lain_project(parent: &Path, name: &str, model: McuModel) -> Result<(PathBuf, PathBuf, McuModel), String> {
     let name = validate_leaf_name(name)?;
     let root = parent.join(&name);
     if root.exists() {
@@ -1025,5 +1034,25 @@ fn try_create_lain_project(parent: &Path, name: &str) -> Result<(PathBuf, PathBu
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let lain_path = root.join(format!("{name}.lain"));
     fs::write(&lain_path, "").map_err(|e| e.to_string())?;
-    Ok((root, lain_path))
+    let marker = match model {
+        McuModel::Atmega128A => root.join(".128"),
+        McuModel::Atmega328P => root.join(".328"),
+    };
+    fs::write(marker, "").map_err(|e| e.to_string())?;
+    Ok((root, lain_path, model))
+}
+
+fn ensure_workspace_model_marker(root: &Path) -> Result<McuModel, String> {
+    let marker_128 = root.join(".128");
+    let marker_328 = root.join(".328");
+
+    if marker_128.exists() {
+        return Ok(McuModel::Atmega128A);
+    }
+    if marker_328.exists() {
+        return Ok(McuModel::Atmega328P);
+    }
+
+    fs::write(&marker_328, "").map_err(|e| e.to_string())?;
+    Ok(McuModel::Atmega328P)
 }

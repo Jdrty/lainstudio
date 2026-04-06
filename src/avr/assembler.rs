@@ -5,7 +5,7 @@
 //! extras: equ forms bare_assign $hex low_high io_names equ_immediates
 
 use std::collections::HashMap;
-use super::io_map;
+use super::{io_map, McuModel};
 
 // public_api
 
@@ -58,15 +58,28 @@ fn is_dot_byte_directive(instr: &str) -> bool {
 pub fn assemble_full(
     source: &str,
 ) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
-    assemble_inner(source, true)
+    assemble_full_for_model(source, McuModel::Atmega128A)
 }
 
+pub fn assemble_full_for_model(
+    source: &str,
+    model: McuModel,
+) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
+    assemble_inner(source, model, true)
+}
+
+#[allow(dead_code)]
 pub fn assemble(source: &str) -> Result<Vec<u16>, Vec<AsmError>> {
-    assemble_inner(source, false).map(|(w, _)| w)
+    assemble_for_model(source, McuModel::Atmega128A)
+}
+
+pub fn assemble_for_model(source: &str, model: McuModel) -> Result<Vec<u16>, Vec<AsmError>> {
+    assemble_inner(source, model, false).map(|(w, _)| w)
 }
 
 fn assemble_inner(
     source: &str,
+    model: McuModel,
     build_map: bool,
 ) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
     // preprocess: normalize local numeric labels (1: / 1b / 1f)
@@ -74,7 +87,7 @@ fn assemble_inner(
     let source = preprocessed.as_str();
 
     // pass_0 builtins_then_user_equ sym resolves in_order no_forward_equ
-    let mut equates = builtin_equates();
+    let mut equates = builtin_equates(model);
     for raw in source.lines() {
         let line = strip_comment(raw).trim();
         if let Some((name, val_raw)) = parse_equate_name(line) {
@@ -186,7 +199,7 @@ fn parse_org(line: &str, equates: &HashMap<String, u32>) -> Option<u32> {
 }
 
 /// builtin_equates like avr_io_h io_names→io_addr_0_3f in_out_sbi_cbi_ok bit_eq→0_7
-fn builtin_equates() -> HashMap<String, u32> {
+fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     let mut m: HashMap<String, u32> = HashMap::new();
     // add closure lowercases keys
     let mut add = |k: &str, v: u32| { m.insert(k.to_lowercase(), v); };
@@ -388,6 +401,50 @@ fn builtin_equates() -> HashMap<String, u32> {
     // mcucr_bits
     add("IVCE",  0); add("IVSEL", 1); add("PUD",   4);
     add("SRW10", 5); add("SRE",   6);
+
+    if model == McuModel::Atmega328P {
+        // ATmega328P memory geometry
+        add("RAMEND",   0x08FF);
+        add("FLASHEND", 0x3FFF);
+        add("E2END",    0x03FF);
+
+        // remove 128A-only ports and timer3/usart1 vectors/register aliases.
+        for k in [
+            "pina", "ddra", "porta", "pine", "ddre", "porte", "pinf", "ddrf", "portf",
+            "ping", "ddrg", "portg",
+            "icr3l", "icr3h", "ocr3cl", "ocr3ch", "ocr3bl", "ocr3bh", "ocr3al", "ocr3ah",
+            "tcnt3l", "tcnt3h", "tccr3a", "tccr3b", "tccr3c", "etimsk", "etifr",
+            "ubrr1h", "ubrr1l", "ucsr1a", "ucsr1b", "ucsr1c", "udr1",
+            "timer1_compc_vect", "timer3_capt_vect", "timer3_compa_vect", "timer3_compb_vect",
+            "timer3_compc_vect", "timer3_ovf_vect", "usart1_rx_vect", "usart1_udre_vect",
+            "usart1_tx_vect",
+        ] {
+            m.remove(k);
+        }
+
+        // remove port bit aliases for non-existent ports on 328P.
+        for bit in 0u32..8 {
+            m.remove(format!("pa{bit}").as_str());
+            m.remove(format!("porta{bit}").as_str());
+            m.remove(format!("ddra{bit}").as_str());
+            m.remove(format!("pina{bit}").as_str());
+
+            m.remove(format!("pe{bit}").as_str());
+            m.remove(format!("porte{bit}").as_str());
+            m.remove(format!("ddre{bit}").as_str());
+            m.remove(format!("pine{bit}").as_str());
+
+            m.remove(format!("pf{bit}").as_str());
+            m.remove(format!("portf{bit}").as_str());
+            m.remove(format!("ddrf{bit}").as_str());
+            m.remove(format!("pinf{bit}").as_str());
+
+            m.remove(format!("pg{bit}").as_str());
+            m.remove(format!("portg{bit}").as_str());
+            m.remove(format!("ddrg{bit}").as_str());
+            m.remove(format!("ping{bit}").as_str());
+        }
+    }
 
     m
 }

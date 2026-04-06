@@ -7,7 +7,6 @@ use eframe::egui::{
 
 use crate::avr::cpu::{
     Cpu, StepResult, SREG_C, SREG_H, SREG_I, SREG_N, SREG_S, SREG_T, SREG_V, SREG_Z,
-    FLASH_WORDS,
 };
 use crate::avr::io_map;
 use crate::welcome::{START_GREEN, START_GREEN_DIM};
@@ -18,7 +17,6 @@ const ERR_RED: Color32 = Color32::from_rgb(255, 80,  80);
 
 // public_types
 const FLASH_PER_PAGE: usize = 128;
-const FLASH_TOTAL_PAGES: usize = FLASH_WORDS / FLASH_PER_PAGE; // 512
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break, Stack }
@@ -181,7 +179,7 @@ pub fn show_sim_panel(
 
             // sticky_header
             ui.label(
-                RichText::new("[ AVR SIM  ATmega128A ]")
+                RichText::new(format!("[ AVR SIM  {} ]", cpu.model.label()))
                     .monospace().size(13.0).color(START_GREEN),
             );
             ui.add_space(4.0);
@@ -387,14 +385,14 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
     let pc    = cpu.pc;
     let start = pc.saturating_sub(3);
     for addr in start..start + 8 {
-        if addr as usize >= FLASH_WORDS { break; }
+        if addr as usize >= cpu.flash_words() { break; }
         let is_current = addr == pc;
         let arrow  = if is_current { "\u{2192}" } else { " " };
         let op     = cpu.flash[addr as usize];
         let disasm = cpu.disasm_at(addr);
         let cyc    = Cpu::instr_cycles_str(op);
         let color  = if is_current { AMBER } else { START_GREEN_DIM };
-        let ivt_ann = Cpu::ivt_name(addr as u32)
+        let ivt_ann = cpu.ivt_name(addr as u32)
             .map(|n| format!("  ; <{n}>"))
             .unwrap_or_default();
         ui.label(
@@ -429,7 +427,7 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu) {
     section_label(ui, "GPIO PORTS  (DDR=0 INPUT, DDR=1 OUTPUT)");
     ui.add_space(6.0);
 
-    let xmem_active = !cpu.xmem.is_empty();
+    let xmem_active = cpu.has_xmem() && !cpu.xmem.is_empty();
     let (xmem_portc_n, xmem_portc_mask) = if xmem_active {
         let sz = cpu.xmem.len() as u32;
         let n = xmem_portc_pins(sz);
@@ -446,7 +444,7 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu) {
     ui.add_space(2.0);
     ui.separator();
 
-    for &(name, port_addr, ddr_addr, pin_addr) in &io_map::PORTS {
+    for &(name, port_addr, ddr_addr, pin_addr) in cpu.gpio_ports() {
         let port = cpu.read_mem(port_addr);
         let ddr  = cpu.read_mem(ddr_addr);
         let pin  = cpu.read_mem(pin_addr);
@@ -536,7 +534,6 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu) {
 }
 
 // timers_tab
-
 fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
     let mut action = SimAction::None;
     // data_addr_to_io_idx
@@ -636,48 +633,50 @@ fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
     ui.separator();
     ui.add_space(4.0);
 
-    // timer3_ui
-    timer_section(ui, "TIMER 3", "(16-bit)");
+    if cpu.has_timer3() {
+        // timer3_ui
+        timer_section(ui, "TIMER 3", "(16-bit)");
 
-    let etifr  = ix(io_map::ETIFR);
-    let etimsk = ix(io_map::ETIMSK);
+        let etifr  = ix(io_map::ETIFR);
+        let etimsk = ix(io_map::ETIMSK);
 
-    let tccr3a = ix(io_map::TCCR3A);
-    let tccr3b = ix(io_map::TCCR3B);
-    let tccr3c = ix(io_map::TCCR3C);
-    let tcnt3  = (ix(io_map::TCNT3H) as u16) << 8 | ix(io_map::TCNT3L) as u16;
-    let ocr3a  = (ix(io_map::OCR3AH) as u16) << 8 | ix(io_map::OCR3AL) as u16;
-    let ocr3b  = (ix(io_map::OCR3BH) as u16) << 8 | ix(io_map::OCR3BL) as u16;
-    let ocr3c  = (ix(io_map::OCR3CH) as u16) << 8 | ix(io_map::OCR3CL) as u16;
-    let cs3    = tccr3b & 0x07;
-    let ctc3   = (tccr3b & 0x08) != 0;
+        let tccr3a = ix(io_map::TCCR3A);
+        let tccr3b = ix(io_map::TCCR3B);
+        let tccr3c = ix(io_map::TCCR3C);
+        let tcnt3  = (ix(io_map::TCNT3H) as u16) << 8 | ix(io_map::TCNT3L) as u16;
+        let ocr3a  = (ix(io_map::OCR3AH) as u16) << 8 | ix(io_map::OCR3AL) as u16;
+        let ocr3b  = (ix(io_map::OCR3BH) as u16) << 8 | ix(io_map::OCR3BL) as u16;
+        let ocr3c  = (ix(io_map::OCR3CH) as u16) << 8 | ix(io_map::OCR3CL) as u16;
+        let cs3    = tccr3b & 0x07;
+        let ctc3   = (tccr3b & 0x08) != 0;
 
-    Grid::new("t3_grid").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
-        kv3(ui, "TCCR3A", &format!("{tccr3a:02X}"), "");
-        kv3(ui, "TCCR3B", &format!("{tccr3b:02X}"),
-            &format!("{}  {}", t01_cs_str(cs3), if ctc3 { "CTC" } else { "Normal" }));
-        kv3(ui, "TCCR3C", &format!("{tccr3c:02X}"), "");
-        kv3(ui, "TCNT3",  &format!("{tcnt3:04X}"), &format!("[{}]", tcnt3));
-        kv3(ui, "OCR3A",  &format!("{ocr3a:04X}"), &format!("[{}]", ocr3a));
-        kv3(ui, "OCR3B",  &format!("{ocr3b:04X}"), &format!("[{}]", ocr3b));
-        kv3(ui, "OCR3C",  &format!("{ocr3c:04X}"), &format!("[{}]", ocr3c));
-    });
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        flag_lbl(ui, "TOV3",   etifr & 0x10 != 0);
-        flag_lbl(ui, "OCF3A",  etifr & 0x08 != 0);
-        flag_lbl(ui, "OCF3B",  etifr & 0x04 != 0);
-        flag_lbl(ui, "OCF3C",  etifr & 0x02 != 0);
-        ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
-        flag_lbl(ui, "TOIE3",  etimsk & 0x10 != 0);
-        flag_lbl(ui, "OCIE3A", etimsk & 0x08 != 0);
-        flag_lbl(ui, "OCIE3B", etimsk & 0x04 != 0);
-        flag_lbl(ui, "OCIE3C", etimsk & 0x02 != 0);
-    });
+        Grid::new("t3_grid").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+            kv3(ui, "TCCR3A", &format!("{tccr3a:02X}"), "");
+            kv3(ui, "TCCR3B", &format!("{tccr3b:02X}"),
+                &format!("{}  {}", t01_cs_str(cs3), if ctc3 { "CTC" } else { "Normal" }));
+            kv3(ui, "TCCR3C", &format!("{tccr3c:02X}"), "");
+            kv3(ui, "TCNT3",  &format!("{tcnt3:04X}"), &format!("[{}]", tcnt3));
+            kv3(ui, "OCR3A",  &format!("{ocr3a:04X}"), &format!("[{}]", ocr3a));
+            kv3(ui, "OCR3B",  &format!("{ocr3b:04X}"), &format!("[{}]", ocr3b));
+            kv3(ui, "OCR3C",  &format!("{ocr3c:04X}"), &format!("[{}]", ocr3c));
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            flag_lbl(ui, "TOV3",   etifr & 0x10 != 0);
+            flag_lbl(ui, "OCF3A",  etifr & 0x08 != 0);
+            flag_lbl(ui, "OCF3B",  etifr & 0x04 != 0);
+            flag_lbl(ui, "OCF3C",  etifr & 0x02 != 0);
+            ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
+            flag_lbl(ui, "TOIE3",  etimsk & 0x10 != 0);
+            flag_lbl(ui, "OCIE3A", etimsk & 0x08 != 0);
+            flag_lbl(ui, "OCIE3B", etimsk & 0x04 != 0);
+            flag_lbl(ui, "OCIE3C", etimsk & 0x02 != 0);
+        });
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(4.0);
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+    }
 
     // timsk_tifr_raw
     section_label(ui, "REGISTERS (raw)");
@@ -685,8 +684,12 @@ fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
     Grid::new("tmr_raw").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
         kv3(ui, "TIMSK",  &format!("{timsk:02X}"),  &format!("{timsk:08b}b"));
         kv3(ui, "TIFR",   &format!("{tifr:02X}"),   &format!("{tifr:08b}b"));
-        kv3(ui, "ETIMSK", &format!("{etimsk:02X}"), &format!("{etimsk:08b}b"));
-        kv3(ui, "ETIFR",  &format!("{etifr:02X}"),  &format!("{etifr:08b}b"));
+        if cpu.has_timer3() {
+            let etimsk = ix(io_map::ETIMSK);
+            let etifr  = ix(io_map::ETIFR);
+            kv3(ui, "ETIMSK", &format!("{etimsk:02X}"), &format!("{etimsk:08b}b"));
+            kv3(ui, "ETIFR",  &format!("{etifr:02X}"),  &format!("{etifr:08b}b"));
+        }
     });
 
     // manual_interrupt_triggers
@@ -737,18 +740,19 @@ fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
         ui.add_space(4.0);
         trig_btn(ui, "OCF2", io_map::TIFR, 0x80);
     });
-    ui.add_space(4.0);
-
-    timer_section(ui, "TIMER 3 triggers", "");
-    ui.horizontal(|ui| {
-        trig_btn(ui, "TOV3",  io_map::ETIFR, 0x10);
+    if cpu.has_timer3() {
         ui.add_space(4.0);
-        trig_btn(ui, "OCF3A", io_map::ETIFR, 0x08);
-        ui.add_space(4.0);
-        trig_btn(ui, "OCF3B", io_map::ETIFR, 0x04);
-        ui.add_space(4.0);
-        trig_btn(ui, "OCF3C", io_map::ETIFR, 0x02);
-    });
+        timer_section(ui, "TIMER 3 triggers", "");
+        ui.horizontal(|ui| {
+            trig_btn(ui, "TOV3",  io_map::ETIFR, 0x10);
+            ui.add_space(4.0);
+            trig_btn(ui, "OCF3A", io_map::ETIFR, 0x08);
+            ui.add_space(4.0);
+            trig_btn(ui, "OCF3B", io_map::ETIFR, 0x04);
+            ui.add_space(4.0);
+            trig_btn(ui, "OCF3C", io_map::ETIFR, 0x02);
+        });
+    }
 
     action
 }
@@ -765,17 +769,22 @@ fn xmem_portc_pins(size: u32) -> u8 {
 fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
     let mut action = SimAction::None;
     let sp = cpu.sp;
+    let ram_start = cpu.ram_start();
+    let ram_end = cpu.ram_end();
+    let xmem_base = cpu.xmem_base() as u32;
 
     // ── XMEM config ──────────────────────────────────────────────────────────
-    let xmem_active = !cpu.xmem.is_empty();
+    let xmem_supported = cpu.has_xmem();
+    let xmem_active = xmem_supported && !cpu.xmem.is_empty();
     let xmem_size   = cpu.xmem.len() as u32;
 
-    ui.separator();
-    ui.add_space(2.0);
-    section_label(ui, "EXTERNAL SRAM (XMEM)");
-    ui.add_space(4.0);
+    if xmem_supported {
+        ui.separator();
+        ui.add_space(2.0);
+        section_label(ui, "EXTERNAL SRAM (XMEM)");
+        ui.add_space(4.0);
 
-    ui.label(
+        ui.label(
         RichText::new(
             "Maps data addresses 0x1100–0x(end) to an external SRAM chip via a \
              multiplexed bus. Hardware pins are assigned automatically; no DDR \
@@ -783,14 +792,14 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         )
         .monospace().size(10.0).color(DIM),
     );
-    ui.add_space(6.0);
+        ui.add_space(6.0);
 
     // size_input_row
-    let parsed_size: Option<u32> = xmem.size_text.trim().parse::<u32>().ok()
+        let parsed_size: Option<u32> = xmem.size_text.trim().parse::<u32>().ok()
         .filter(|&v| v > 0 && v <= XMEM_MAX);
-    let input_ok = parsed_size.is_some();
+        let input_ok = parsed_size.is_some();
 
-    ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
         ui.label(RichText::new("Size:").monospace().size(11.0).color(START_GREEN_DIM));
         let resp = ui.add(
             TextEdit::singleline(&mut xmem.size_text)
@@ -804,17 +813,17 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 .monospace().size(10.0).color(DIM),
         );
         let _ = resp;
-    });
+        });
 
-    if !input_ok && !xmem.size_text.trim().is_empty() {
+        if !input_ok && !xmem.size_text.trim().is_empty() {
         ui.label(
             RichText::new(format!("✗ must be 1–{XMEM_MAX}"))
                 .monospace().size(10.5).color(ERR_RED),
         );
-    }
+        }
 
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
         // ENABLE button
         let can_enable = input_ok;
         if ui.add_enabled(
@@ -836,14 +845,14 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         if xmem_active {
             ui.add_space(8.0);
             ui.label(
-                RichText::new(format!("ACTIVE  {xmem_size} B  (0x1100–0x{:04X})", 0x1100 + xmem_size - 1))
+                RichText::new(format!("ACTIVE  {xmem_size} B  (0x{xmem_base:04X}–0x{:04X})", xmem_base + xmem_size - 1))
                     .monospace().size(11.0).color(AMBER),
             );
         }
-    });
+        });
 
     // pin_assignment
-    if xmem_active {
+        if xmem_active {
         let portc_n = xmem_portc_pins(xmem_size);
         let portc_mask: u8 = if portc_n >= 8 { 0xFF } else { (1u8 << portc_n).wrapping_sub(1) };
 
@@ -910,6 +919,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 );
             }
         }
+        }
     }
 
     ui.add_space(6.0);
@@ -917,7 +927,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
     ui.add_space(4.0);
 
     // sp_status
-    section_label(ui, "SRAM  0x0100 – 0x10FF  (4 096 bytes)");
+    section_label(ui, &format!("SRAM  0x{ram_start:04X} – 0x{ram_end:04X}  ({} bytes)", cpu.sram.len()));
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
@@ -926,9 +936,9 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
             RichText::new(format!("0x{sp:04X}"))
                 .monospace().size(12.0).color(START_GREEN),
         );
-        let sp_in_sram = sp >= 0x0100 && sp <= 0x10FF;
+        let sp_in_sram = sp >= ram_start && sp <= ram_end;
         if sp_in_sram {
-            let depth = 0x10FF_u16.wrapping_sub(sp);
+            let depth = ram_end.wrapping_sub(sp);
             ui.add_space(8.0);
             ui.label(
                 RichText::new(format!("(stack depth: {depth} B)"))
@@ -944,8 +954,8 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
     ui.add_space(4.0);
 
     // sp_row_index
-    let sp_row: Option<usize> = if sp >= 0x0100 && sp <= 0x10FF {
-        let sram_off = (sp - 0x0100) as usize;
+    let sp_row: Option<usize> = if sp >= ram_start && sp <= ram_end {
+        let sram_off = (sp - ram_start) as usize;
         Some(sram_off / 8)
     } else {
         None
@@ -974,7 +984,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
 
             for row in 0..rows {
                 let base       = row * 8;
-                let addr       = 0x0100u32 + base as u32;
+                let addr       = ram_start as u32 + base as u32;
                 let slice      = &sram[base..base + 8];
                 let all0       = slice.iter().all(|&b| b == 0);
                 let is_sp_row  = sp_row == Some(row);
@@ -1032,7 +1042,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(4.0);
-        section_label(ui, &format!("XMEM  0x1100 – 0x{:04X}  ({xmem_size} bytes)", 0x1100u32 + xmem_size - 1));
+        section_label(ui, &format!("XMEM  0x{xmem_base:04X} – 0x{:04X}  ({xmem_size} bytes)", xmem_base + xmem_size - 1));
         ui.add_space(4.0);
 
         ui.label(
@@ -1056,7 +1066,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 continue;
             }
             skipping = false;
-            let addr = 0x1100u32 + base as u32;
+            let addr = xmem_base + base as u32;
             let mut line = format!("  0x{addr:04X}  ");
             for b in slice { line.push_str(&format!(" {b:02X}  ")); }
             ui.label(RichText::new(line).monospace().size(10.5).color(START_GREEN));
@@ -1068,7 +1078,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(4.0);
-        section_label(ui, "EEPROM  0x000 – 0xFFF  (4 096 bytes, non-volatile)");
+        section_label(ui, &format!("EEPROM  0x000 – 0x{:03X}  ({} bytes, non-volatile)", cpu.eeprom.len().saturating_sub(1), cpu.eeprom.len()));
         ui.add_space(2.0);
         ui.label(
             RichText::new("  Persists across reset. Unprogrammed bytes = 0xFF.")
@@ -1114,6 +1124,8 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
     let sp  = cpu.sp;
     let sph = (sp >> 8) as u8;
     let spl = (sp & 0xFF) as u8;
+    let ram_start = cpu.ram_start();
+    let ramend = cpu.ram_end();
 
     section_label(ui, "STACK POINTER");
     ui.add_space(4.0);
@@ -1127,7 +1139,6 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
     });
 
     ui.add_space(4.0);
-    let ramend: u16 = 0x10FF;
     let stack_top = sp.wrapping_add(1);
     let depth = if sp < ramend { ramend - sp } else { 0 };
 
@@ -1177,14 +1188,14 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
         for row in first_row..=last_row {
             let row_base = row * row_width;
             let sp_row = sp >= row_base as u16 && (sp as usize) < row_base + row_width
-                         && sp >= 0x0100;
+                         && sp >= ram_start;
             let color_row = if sp_row { AMBER } else { START_GREEN };
 
             let mut line = format!("  0x{row_base:04X}  ");
             let mut has_content = false;
             for col in 0..row_width {
                 let addr = row_base + col;
-                if addr < 0x0100 || addr > ramend as usize {
+                if addr < ram_start as usize || addr > ramend as usize {
                     line.push_str("     ");
                     continue;
                 }
@@ -1192,7 +1203,7 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
                     line.push_str("  .. ");
                     continue;
                 }
-                    let b = cpu.sram[addr - 0x0100];
+                    let b = cpu.sram[addr - ram_start as usize];
                     let is_sp = addr as u16 == sp;
                 if is_sp {
                     line.push_str(&format!("[{b:02X}] "));
@@ -1259,12 +1270,12 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
                         if addr + 1 <= ramend as usize {
                             // read 2-byte pair: AVR pushes PCH first (higher addr), PCL second (lower addr)
                             // top of stack = SP+1 = PCL, SP+2 = PCH
-                            let lo = cpu.sram[addr     - 0x0100];
-                            let hi = cpu.sram[addr + 1 - 0x0100];
+                            let lo = cpu.sram[addr     - ram_start as usize];
+                            let hi = cpu.sram[addr + 1 - ram_start as usize];
                             let word_addr = (hi as u32) << 8 | lo as u32;
 
                             if word_addr > 0
-                                && (word_addr as usize) < FLASH_WORDS
+                                && (word_addr as usize) < cpu.flash_words()
                                 && cpu.flash[word_addr as usize] != 0
                             {
                                 // looks like a return address
@@ -1287,7 +1298,7 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
                             }
                         }
                         // single byte (pushed variable or data)
-                let b = cpu.sram[addr - 0x0100];
+                let b = cpu.sram[addr - ram_start as usize];
                 let note = if b == 0 { " (zero)" } else { "" };
                         ui.label(
                             RichText::new(format!(
@@ -1432,15 +1443,17 @@ fn show_break_tab(ui: &mut Ui, bp: &mut BreakpointState) {
 // flash
 fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
     // header
+    let flash_words = cpu.flash_words();
+    let flash_total_pages = flash_words.div_ceil(FLASH_PER_PAGE);
     section_label(ui, &format!(
-        "FLASH  0x0000–0xFFFF  ({} words)  page {}/{}",
-        FLASH_WORDS, s.page + 1, FLASH_TOTAL_PAGES,
+        "FLASH  0x0000–0x{:04X}  ({} words)  page {}/{}",
+        flash_words.saturating_sub(1), flash_words, s.page + 1, flash_total_pages,
     ));
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
         // → PC: jump to the page that contains the current PC
-        let pc_page = cpu.pc as usize / FLASH_PER_PAGE;
+        let pc_page = (cpu.pc as usize / FLASH_PER_PAGE).min(flash_total_pages.saturating_sub(1));
         if retro_btn(ui, "\u{2192}PC").clicked() {
             s.page    = pc_page;
             s.jumping = false;
@@ -1457,7 +1470,7 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
         ui.add_space(4.0);
 
         // if current page is outside 1–5 and not the last, show its number in diff color
-        if s.page >= 5 && s.page < FLASH_TOTAL_PAGES - 1 {
+        if s.page >= 5 && s.page < flash_total_pages.saturating_sub(1) {
             ui.label(
                 RichText::new(format!("[{}]", s.page + 1))
                     .monospace().size(11.0).color(AMBER),
@@ -1476,7 +1489,7 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
             if enter || resp.lost_focus() {
                 if let Ok(p) = s.jump_text.trim().parse::<usize>() {
-                    s.page = p.saturating_sub(1).min(FLASH_TOTAL_PAGES - 1);
+                    s.page = p.saturating_sub(1).min(flash_total_pages.saturating_sub(1));
                 }
                 s.jumping = false;
             }
@@ -1488,8 +1501,8 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
         ui.add_space(4.0);
 
         // last page always visible
-        let last = FLASH_TOTAL_PAGES - 1;
-        if flash_page_btn(ui, &format!("{}", FLASH_TOTAL_PAGES), s.page == last).clicked() {
+        let last = flash_total_pages.saturating_sub(1);
+        if flash_page_btn(ui, &format!("{}", flash_total_pages), s.page == last).clicked() {
             s.page    = last;
             s.jumping = false;
         }
@@ -1509,19 +1522,19 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
 
     // instruction rows
     let page_start = (s.page * FLASH_PER_PAGE) as u32;
-    let page_end   = (page_start + FLASH_PER_PAGE as u32).min(FLASH_WORDS as u32);
+    let page_end   = (page_start + FLASH_PER_PAGE as u32).min(flash_words as u32);
 
     let mut addr = page_start;
     let mut zero_run_start: Option<u32> = None;
 
     while addr < page_end {
-        let op = if (addr as usize) < FLASH_WORDS {
+        let op = if (addr as usize) < flash_words {
             unsafe { *cpu.flash.get_unchecked(addr as usize) }
         } else {
             0
         };
         let nwords  = Cpu::instr_words(op);
-        let op2     = if nwords == 2 && (addr as usize + 1) < FLASH_WORDS {
+        let op2     = if nwords == 2 && (addr as usize + 1) < flash_words {
             unsafe { *cpu.flash.get_unchecked(addr as usize + 1) }
         } else {
             0
@@ -1553,7 +1566,7 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
             format!("{op:04X}     ")
         };
         let disasm = cpu.disasm_at(addr);
-        let ivt    = Cpu::ivt_name(addr)
+        let ivt    = cpu.ivt_name(addr)
             .map(|n| format!("  ; <{n}>"))
             .unwrap_or_default();
         let (color, size) = if is_pc { (AMBER, 12.5_f32) } else { (START_GREEN, 12.0_f32) };
