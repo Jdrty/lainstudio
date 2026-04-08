@@ -39,6 +39,27 @@ use crate::welcome_font;
 /// Written by “Assemble and Link”; consumed by avrdude.
 const FIRMWARE_HEX: &str = "firmware.hex";
 
+/// Initial `.lain` for new ATmega328P projects: Uno built-in LED is **PB5** → bitmask **0x20** (not 0x01 = PB0 / D8).
+const NEW_PROJECT_LAIN_ATMEGA328P: &str = r#".cseg
+; Arduino Uno built-in LED = PB5 (digital pin 13). Mask 0x20 = 1 << 5.  (0x01 would toggle PB0 / pin 8.)
+    EOR  R17, R17
+    LDI  R16, 0x20
+    OUT  DDRB, R16
+loop:
+    EOR  R17, R16
+    OUT  PORTB, R17
+    LDI  R18, 40
+outer: LDI  R19, 255
+mid:   LDI  R20, 255
+inner: DEC  R20
+       BRNE inner
+       DEC  R19
+       BRNE mid
+       DEC  R18
+       BRNE outer
+    RJMP loop
+"#;
+
 pub fn setup_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -215,11 +236,11 @@ pub struct LainApp {
     // token-bucket for the IPS speed limiter (wall-clock based, not frame-dt)
     limit_clock:      std::time::Instant,
     limit_steps_done: u64,
-    /// Right panel: firmware hex + avrdude (replaces SIM / helpers while open).
+    /// right panel: firmware hex + avrdude (replaces SIM / helpers while open)
     show_upload: bool,
     upload_programmer: String,
     upload_port: String,
-    /// When true, `-P` is edited as free text; otherwise chosen from the serial port list.
+    /// when true, `-P` is edited as free text; otherwise chosen from the serial port list
     upload_port_custom: bool,
     upload_status_line: String,
     upload_job_rx: Option<Receiver<String>>,
@@ -271,7 +292,7 @@ impl LainApp {
         }
     }
 
-    /// Return (filename, content) pairs for all .lain files in the workspace root.
+    /// return (filename, content) pairs for all .lain files in the workspace root
     fn collect_lain_files(&self) -> Vec<(String, String)> {
         let Some(ws) = self.current_workspace() else { return vec![]; };
         let Ok(entries) = std::fs::read_dir(&ws.root) else { return vec![]; };
@@ -389,17 +410,6 @@ impl LainApp {
         expand_source_with_includes(workspace, active, self.editor.source())
     }
 
-    fn firmware_hex_path(&self) -> Option<PathBuf> {
-        self.current_workspace()
-            .map(|w| w.root.join(FIRMWARE_HEX))
-    }
-
-    fn firmware_hex_exists(&self) -> bool {
-        self.firmware_hex_path()
-            .map(|p| p.is_file())
-            .unwrap_or(false)
-    }
-
     fn assemble_and_write_firmware_hex(&mut self) -> Result<(), String> {
         if self.editor.is_dirty() {
             self.save_current_file()?;
@@ -416,15 +426,17 @@ impl LainApp {
                 .join("   ")
         })?;
         let flash_words = model.flash_word_count();
-        let hex_text = intel_hex::flash_words_to_intel_hex(&words, flash_words);
+        let app_words = model.application_flash_words();
+        let hex_text = intel_hex::flash_words_to_intel_hex(&words, app_words);
         validate_intel_hex(&hex_text)?;
         let path = workspace.root.join(FIRMWARE_HEX);
         fs::write(&path, &hex_text).map_err(|e| e.to_string())?;
         self.upload_status_line = format!(
-            "OK: wrote {} — Intel HEX validated, {} words ({} bytes).",
+            "OK: wrote {} — Intel HEX validated, {} app words of {} flash ({} bytes), bootloader tail omitted.",
             path.display(),
+            app_words,
             flash_words,
-            flash_words * 2
+            app_words * 2
         );
         Ok(())
     }
@@ -475,7 +487,7 @@ impl LainApp {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            self.spawn_avrdude_upload();
+            self.rebuild_firmware_hex_then_upload();
             return;
         }
         if msg.starts_with("INSTALL_FAIL\n") {
@@ -487,6 +499,17 @@ impl LainApp {
             return;
         }
         self.upload_status_line = msg;
+    }
+
+    /// re-run assemble so `firmware.hex` matches the editor and omits the bootloader tail, then upload
+    fn rebuild_firmware_hex_then_upload(&mut self) {
+        match self.assemble_and_write_firmware_hex() {
+            Ok(()) => self.spawn_avrdude_upload(),
+            Err(e) => {
+                self.upload_status_line =
+                    format!("Error: assemble before upload failed — {e}");
+            }
+        }
     }
 
     fn spawn_avrdude_upload(&mut self) {
@@ -1206,7 +1229,7 @@ impl eframe::App for LainApp {
                         upload_action = show_upload_panel(
                             ui,
                             FIRMWARE_HEX,
-                            self.firmware_hex_exists(),
+                            self.current_workspace().is_some(),
                             model.avrdude_part(),
                             model.label(),
                             &mut self.upload_programmer,
@@ -1340,7 +1363,7 @@ impl eframe::App for LainApp {
                 Ok(()) => self.set_status(format!("Wrote {FIRMWARE_HEX} in project folder.")),
                 Err(e) => self.set_error(e),
             },
-            UploadAction::UploadAvrdude => self.spawn_avrdude_upload(),
+            UploadAction::UploadAvrdude => self.rebuild_firmware_hex_then_upload(),
         }
 
         match sim_action {
@@ -1572,7 +1595,11 @@ fn try_create_lain_project(parent: &Path, name: &str, model: McuModel) -> Result
     }
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let lain_path = root.join(format!("{name}.lain"));
-    fs::write(&lain_path, "").map_err(|e| e.to_string())?;
+    let initial_src = match model {
+        McuModel::Atmega328P => NEW_PROJECT_LAIN_ATMEGA328P,
+        McuModel::Atmega128A => "",
+    };
+    fs::write(&lain_path, initial_src).map_err(|e| e.to_string())?;
     let marker = match model {
         McuModel::Atmega128A => root.join(".128"),
         McuModel::Atmega328P => root.join(".328"),

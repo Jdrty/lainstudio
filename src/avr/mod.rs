@@ -27,6 +27,19 @@ impl McuModel {
         }
     }
 
+    pub fn bootloader_reserved_words(self) -> usize {
+        match self {
+            Self::Atmega328P => 256, // 512 B — Optiboot on Uno / Nano (starts at byte 0x7E00)
+            Self::Atmega128A => 512, // 1024 B — typical for larger AVRs with Arduino-style boot
+        }
+    }
+
+    /// Application flash word count for serial uploads (full flash minus bootloader tail).
+    pub fn application_flash_words(self) -> usize {
+        self.flash_word_count()
+            .saturating_sub(self.bootloader_reserved_words())
+    }
+
     /// `avrdude -p` part id (short form).
     pub fn avrdude_part(self) -> &'static str {
         match self {

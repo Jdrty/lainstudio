@@ -47,7 +47,8 @@ pub fn scan_serial_ports() -> Vec<String> {
 pub fn show_upload_panel(
     ui: &mut Ui,
     hex_rel_path: &str,
-    hex_present: bool,
+    // workspace open — upload runs assemble first, then avrdude (hex need not exist yet).
+    upload_enabled: bool,
     avrdude_part: &str,
     mcu_label: &str,
     programmer: &mut String,
@@ -107,6 +108,14 @@ pub fn show_upload_panel(
                         .color(START_GREEN),
                 );
             });
+            if avrdude_part == "m328p" {
+                ui.label(
+                    RichText::new("Uno built-in LED: PB5 — bitmask 0x20 (0x01 is PB0 / D8).")
+                        .monospace()
+                        .size(9.5)
+                        .color(DIM),
+                );
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("-c")
@@ -188,7 +197,7 @@ pub fn show_upload_panel(
 
             ui.add_space(6.0);
 
-            let can_upload = hex_present;
+            let can_upload = upload_enabled;
             let upload_resp = ui.add_enabled(
                 can_upload,
                 Button::new(
@@ -203,6 +212,12 @@ pub fn show_upload_panel(
             if upload_resp.clicked() {
                 action = UploadAction::UploadAvrdude;
             }
+            ui.label(
+                RichText::new("Upload rebuilds firmware.hex (assemble + link), then runs avrdude.")
+                    .monospace()
+                    .size(9.5)
+                    .color(DIM),
+            );
 
             ui.add_space(10.0);
             ui.separator();

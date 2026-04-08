@@ -1,11 +1,11 @@
 #![allow(dead_code)]
-//! atmega128a io data_addrs table24 non_m103
+//! I/O maps: ATmega128A (`IO_NAMES`, `PORTS`) and ATmega328P (`IO_NAMES_328P`, `PORTS_328P`).
 //! std_io 0x20_5f io_off data_minus_20 sbi_cbi_to_data_3f ext_io 0x60_ff ld_st
 
+use super::McuModel;
+
 // std_io_low sbi_cbi_ok
-
 // io00_rsrv
-
 pub const PINE:   u16 = 0x0021; // I/O 0x01 Port E Input Pins
 pub const DDRE:   u16 = 0x0022; // I/O 0x02 Port E Data Direction
 pub const PORTE:  u16 = 0x0023; // I/O 0x03 Port E Data Register
@@ -45,9 +45,7 @@ pub const PORTA:  u16 = 0x003B; // I/O 0x1B Port A Data Register
 pub const RAMPZ:  u16 = 0x003C; // I/O 0x1C Extended Z-Pointer Register
 
 // io1d_1f_rsrv
-
 // std_io_high in_out_no_sbi_above_1f
-
 pub const WDTCR:  u16 = 0x0041; // I/O 0x21 Watchdog Timer Control
 
 pub const OCR2:   u16 = 0x0043; // I/O 0x23 Timer2 Output Compare
@@ -87,7 +85,6 @@ pub const SPH:    u16 = 0x005E; // I/O 0x3E Stack Pointer High
 pub const SREG:   u16 = 0x005F; // I/O 0x3F Status Register
 
 // ext_io ld_st_only
-
 pub const PINF:   u16 = 0x0060; // Port F Input Pins
 pub const DDRF:   u16 = 0x0061; // Port F Data Direction
 pub const PORTF:  u16 = 0x0062; // Port F Data Register
@@ -130,14 +127,13 @@ pub const EEDR:   u16 = 0x003E; // I/O 0x1E EEPROM Data Register
 pub const EECR:   u16 = 0x003F; // I/O 0x1F EEPROM Control Register
 
 // helpers
-
 /// io_to_mem in_out 0_3f
 #[inline]
-pub fn io_to_mem(a: u8) -> u16 {
+pub const fn io_to_mem(a: u8) -> u16 {
     0x0020 + a as u16
 }
 
-/// io_names in_out_0_3f sbi_cbi_max_io_1f_asm_err_else
+/// ATmega128A: `IN`/`OUT`/`SBI` I/O addresses (0…0x3F).
 pub const IO_NAMES: &[(&str, u8)] = &[
     // status_stack
     ("SREG",   0x3F), ("SPH",    0x3E), ("SPL",    0x3D),
@@ -198,6 +194,65 @@ pub const IO_NAMES: &[(&str, u8)] = &[
 
     // xdiv
     ("XDIV",   0x3C),
+];
+
+/// ATmega328P `_SFR_IO8` addresses from avr-libc `iom328p.h` (same encoding as `IN`/`OUT`).
+pub const IO_NAMES_328P: &[(&str, u8)] = &[
+    ("ACSR", 0x30),
+    ("DDRB", 0x04),
+    ("DDRC", 0x07),
+    ("DDRD", 0x0A),
+    ("EEARH", 0x22),
+    ("EEARL", 0x21),
+    ("EECR", 0x1F),
+    ("EEDR", 0x20),
+    ("EIFR", 0x1C),
+    ("EIMSK", 0x1D),
+    ("GPIOR0", 0x1E),
+    ("GPIOR1", 0x2A),
+    ("GPIOR2", 0x2B),
+    ("GTCCR", 0x23),
+    ("MCUCR", 0x35),
+    ("MCUCSR", 0x34),
+    ("MCUSR", 0x34),
+    ("OCR0A", 0x27),
+    ("OCR0B", 0x28),
+    ("PCIFR", 0x1B),
+    ("PINB", 0x03),
+    ("PINC", 0x06),
+    ("PIND", 0x09),
+    ("PORTB", 0x05),
+    ("PORTC", 0x08),
+    ("PORTD", 0x0B),
+    ("SPCR", 0x2C),
+    ("SPDR", 0x2E),
+    ("SPSR", 0x2D),
+    ("SMCR", 0x33),
+    ("SPMCSR", 0x37),
+    ("SPL", 0x3D),
+    ("SPH", 0x3E),
+    ("SREG", 0x3F),
+    ("TCCR0A", 0x24),
+    ("TCCR0B", 0x25),
+    ("TCNT0", 0x26),
+    ("TIFR0", 0x15),
+    ("TIFR1", 0x16),
+    ("TIFR2", 0x17),
+];
+
+#[inline]
+pub fn io_names(model: McuModel) -> &'static [(&'static str, u8)] {
+    match model {
+        McuModel::Atmega128A => IO_NAMES,
+        McuModel::Atmega328P => IO_NAMES_328P,
+    }
+}
+
+/// ATmega328P: data-space addresses (`0x20` + I/O offset) for B/C/D only.
+pub const PORTS_328P: [(&str, u16, u16, u16); 3] = [
+    ("B", io_to_mem(0x05), io_to_mem(0x04), io_to_mem(0x03)),
+    ("C", io_to_mem(0x08), io_to_mem(0x07), io_to_mem(0x06)),
+    ("D", io_to_mem(0x0B), io_to_mem(0x0A), io_to_mem(0x09)),
 ];
 
 /// ports tuple label port_ddr_pin_mem

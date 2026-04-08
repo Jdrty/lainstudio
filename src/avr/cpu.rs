@@ -3,7 +3,6 @@
 //! decode_execute: match op>>12 → llvm jump table, o1 per opcode
 //! step_n: no step() wrapper, unchecked flash, skip redundant wrapping_add
 //! run_timed: 100k_step batches, one Instant::now per batch
-//! .
 
 use super::{io_map, McuModel};
 
@@ -117,11 +116,7 @@ impl Cpu {
     pub fn gpio_ports(&self) -> &'static [(&'static str, u16, u16, u16)] {
         match self.model {
             McuModel::Atmega128A => &io_map::PORTS,
-            McuModel::Atmega328P => &[
-                ("B", io_map::PORTB, io_map::DDRB, io_map::PINB),
-                ("C", io_map::PORTC, io_map::DDRC, io_map::PINC),
-                ("D", io_map::PORTD, io_map::DDRD, io_map::PIND),
-            ],
+            McuModel::Atmega328P => &io_map::PORTS_328P,
         }
     }
     pub fn reset(&mut self) {
@@ -215,7 +210,6 @@ impl Cpu {
     }
 
     // eeprom_peripheral
-
     /// handle a write to the EECR register, emulating the ATmega128A EEPROM controller.
     fn eecr_write(&mut self, val: u8) {
         let idx = (io_map::EECR - 0x0020) as usize;
@@ -265,7 +259,6 @@ impl Cpu {
     }
 
     // reg_pair_helpers
-
     #[inline(always)] fn get_x(&self) -> u16 { u16::from_le_bytes([self.regs[26], self.regs[27]]) }
     #[inline(always)] fn get_y(&self) -> u16 { u16::from_le_bytes([self.regs[28], self.regs[29]]) }
     #[inline(always)] fn get_z(&self) -> u16 { u16::from_le_bytes([self.regs[30], self.regs[31]]) }
@@ -275,7 +268,6 @@ impl Cpu {
     #[inline(always)] fn set_z(&mut self, v: u16) { let b = v.to_le_bytes(); self.regs[30]=b[0]; self.regs[31]=b[1]; }
 
     // stack
-
     #[inline(always)] fn push(&mut self, v: u8) { self.write_mem(self.sp, v); self.sp = self.sp.wrapping_sub(1); }
     #[inline(always)] fn pop(&mut self) -> u8   { self.sp = self.sp.wrapping_add(1); self.read_mem(self.sp) }
 
@@ -290,7 +282,6 @@ impl Cpu {
     }
 
     // skip_helper
-
     #[inline(always)]
     fn is_2word(op: u16) -> bool {
         (op & 0xFE0F == 0x9000)
@@ -300,7 +291,6 @@ impl Cpu {
     }
 
     // sreg_helpers
-
     #[inline(always)]
     fn set_sreg_bit(&mut self, bit: u8, val: bool) {
         if val { self.sreg |= 1 << bit; } else { self.sreg &= !(1 << bit); }
@@ -356,7 +346,7 @@ impl Cpu {
         self.step_n_hook(n, |_| {})
     }
 
-    /// Like [`Self::step_n`], but invokes `hook` after each successfully decoded instruction.
+    /// similar to [`Self::step_n`], but invokes `hook` after each successfully decoded instruction.
     pub fn step_n_hook<F: FnMut(&Cpu)>(&mut self, n: u32, mut hook: F) -> (u32, StepResult) {
         let mut ran = 0u32;
         while ran < n {
@@ -389,8 +379,8 @@ impl Cpu {
         }
     }
 
-    /// like run_timed but stops early when PC hits a breakpoint address.
-    /// returns (steps, result, breakpoint_hit_addr).
+    /// sort of like run_timed but stops early when PC hits a breakpoint address.
+    /// returns (steps, result, breakpoint_hit_addr)
     #[allow(dead_code)] // wrapper over [`Self::run_timed_break_hook`]
     pub fn run_timed_break(
         &mut self,
@@ -769,7 +759,6 @@ impl Cpu {
 
 
     // decode_execute op_hi_nibble o1_dispatch
-
     #[inline(always)]
     fn decode_execute(&mut self, op: u16) -> StepResult {
 
@@ -1096,7 +1085,6 @@ impl Cpu {
     }
 
     // exec_g9 second_nibble dispatch o1
-
     fn exec_g9(&mut self, op: u16) -> StepResult {
         let d = ((op >> 4) & 0x1F) as usize; // ld_st_rd_field
         match (op >> 8) & 0xF {
@@ -1603,7 +1591,6 @@ impl Cpu {
 }
 
 // tests
-
 #[cfg(test)]
 mod tests {
     use super::*;

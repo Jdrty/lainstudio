@@ -1,9 +1,11 @@
 //! intel HEX (IHEX) for AVR flash — avrdude `-U flash:w:file.hex:i` compatible
+/// `application_flash_words` should be the span you intend to program (omit the
+/// bootloader region at the end of flash when using a serial bootloader).
 /// build Intel HEX from flash words
-pub fn flash_words_to_intel_hex(words: &[u16], flash_words: usize) -> String {
+pub fn flash_words_to_intel_hex(words: &[u16], application_flash_words: usize) -> String {
     let mut out = String::new();
-    let mut buf: Vec<u8> = Vec::with_capacity(flash_words * 2);
-    for i in 0..flash_words {
+    let mut buf: Vec<u8> = Vec::with_capacity(application_flash_words * 2);
+    for i in 0..application_flash_words {
         let w = words.get(i).copied().unwrap_or(0xFFFF);
         buf.push(w as u8);
         buf.push((w >> 8) as u8);

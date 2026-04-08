@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use super::{io_map, McuModel};
 
 // public_api
-
 #[derive(Debug, Clone)]
 pub struct AsmError {
     pub line: usize,
@@ -189,7 +188,6 @@ fn assemble_inner(
 }
 
 // directive_handling
-
 /// parse_org target_word_addr or none
 fn parse_org(line: &str, equates: &HashMap<String, u32>) -> Option<u32> {
     let rest = line.trim()
@@ -209,11 +207,12 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     }
 
     // io_addrs_io_names (standard IO, 6-bit address for IN/OUT)
-    for &(name, io_addr) in io_map::IO_NAMES {
+    for &(name, io_addr) in io_map::io_names(model) {
         add(name, io_addr as u32);
     }
 
-    // ext_io_data_addrs lds_sts_only (data addresses >= 0x60, not in IO_NAMES)
+    // ext_io_data_addrs lds_sts_only (ATmega128A; 328P uses different mem-mapped layout below)
+    if model == McuModel::Atmega128A {
     add("PINF",   io_map::PINF   as u32);
     add("DDRF",   io_map::DDRF   as u32);
     add("PORTF",  io_map::PORTF  as u32);
@@ -243,58 +242,157 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("UBRR1H", io_map::UBRR1H as u32);
     add("UBRR1L", io_map::UBRR1L as u32);
     add("UDR1",   io_map::UDR1   as u32);
+    }
+
+    if model == McuModel::Atmega328P {
+        // `_SFR_MEM8` / `_SFR_MEM16` addresses for LDS/STS (avr-libc `iom328p.h`)
+        add("WDTCSR", 0x60);
+        add("CLKPR", 0x61);
+        add("PRR", 0x64);
+        add("OSCCAL", 0x66);
+        add("TIMSK0", 0x6E);
+        add("TIMSK1", 0x6F);
+        add("TIMSK2", 0x70);
+        add("ADCL", 0x78);
+        add("ADCH", 0x79);
+        add("ADCSRA", 0x7A);
+        add("ADCSRB", 0x7B);
+        add("ADMUX", 0x7C);
+        add("DIDR0", 0x7E);
+        add("DIDR1", 0x7F);
+        add("TCCR1A", 0x80);
+        add("TCCR1B", 0x81);
+        add("TCCR1C", 0x82);
+        add("TCNT1L", 0x84);
+        add("TCNT1H", 0x85);
+        add("ICR1L", 0x86);
+        add("ICR1H", 0x87);
+        add("OCR1AL", 0x88);
+        add("OCR1AH", 0x89);
+        add("OCR1BL", 0x8A);
+        add("OCR1BH", 0x8B);
+        add("TCCR2A", 0xB0);
+        add("TCCR2B", 0xB1);
+        add("TCNT2", 0xB2);
+        add("OCR2A", 0xB4);
+        add("OCR2B", 0xB5);
+        add("ASSR", 0xB6);
+        add("TWBR", 0xB8);
+        add("TWSR", 0xB9);
+        add("TWAR", 0xBA);
+        add("TWDR", 0xBB);
+        add("TWCR", 0xBC);
+        add("TWAMR", 0xBD);
+        add("UCSR0A", 0xC0);
+        add("UCSR0B", 0xC1);
+        add("UCSR0C", 0xC2);
+        add("UBRR0L", 0xC4);
+        add("UBRR0H", 0xC5);
+        add("UDR0", 0xC6);
+    }
 
     // memory_map_constants
-    add("RAMSTART",   0x0100);
-    add("RAMEND",     0x10FF);
-    add("FLASHEND",   0xFFFF);
-    add("E2END",      0x0FFF);
+    add("RAMSTART", 0x0100);
+    match model {
+        McuModel::Atmega128A => {
+            add("RAMEND", 0x10FF);
+            add("FLASHEND", 0xFFFF);
+            add("E2END", 0x0FFF);
+        }
+        McuModel::Atmega328P => {
+            add("RAMEND", 0x08FF);
+            add("FLASHEND", 0x3FFF);
+            add("E2END", 0x03FF);
+        }
+    }
     add("E2PAGESIZE", 8);
-    add("PAGESIZE",   128);
+    add("PAGESIZE", 128);
 
-    // ivt_word_addrs
-    add("RESET_vect",        0x0000);
-    add("INT0_vect",         0x0002);
-    add("INT1_vect",         0x0004);
-    add("INT2_vect",         0x0006);
-    add("INT3_vect",         0x0008);
-    add("INT4_vect",         0x000A);
-    add("INT5_vect",         0x000C);
-    add("INT6_vect",         0x000E);
-    add("INT7_vect",         0x0010);
-    add("TIMER2_COMP_vect",  0x0012);
-    add("TIMER2_OVF_vect",   0x0014);
-    add("TIMER1_CAPT_vect",  0x0016);
-    add("TIMER1_COMPA_vect", 0x0018);
-    add("TIMER1_COMPB_vect", 0x001A);
-    add("TIMER1_OVF_vect",   0x001C);
-    add("TIMER0_COMP_vect",  0x001E);
-    add("TIMER0_OVF_vect",   0x0020);
-    add("SPI_STC_vect",      0x0022);
-    add("USART0_RX_vect",    0x0024);
-    add("USART0_UDRE_vect",  0x0026);
-    add("USART0_TX_vect",    0x0028);
-    add("ADC_vect",          0x002A);
-    add("EE_RDY_vect",       0x002C);
-    add("ANA_COMP_vect",     0x002E);
-    add("TIMER1_COMPC_vect", 0x0030);
-    add("TIMER3_CAPT_vect",  0x0032);
-    add("TIMER3_COMPA_vect", 0x0034);
-    add("TIMER3_COMPB_vect", 0x0036);
-    add("TIMER3_COMPC_vect", 0x0038);
-    add("TIMER3_OVF_vect",   0x003A);
-    add("USART1_RX_vect",    0x003C);
-    add("USART1_UDRE_vect",  0x003E);
-    add("USART1_TX_vect",    0x0040);
-    add("TWI_vect",          0x0042);
-    add("SPM_RDY_vect",      0x0044);
+    // interrupt vector byte addresses in flash (`.org` / `jmp` targets)
+    match model {
+        McuModel::Atmega128A => {
+            add("RESET_vect", 0x0000);
+            add("INT0_vect", 0x0002);
+            add("INT1_vect", 0x0004);
+            add("INT2_vect", 0x0006);
+            add("INT3_vect", 0x0008);
+            add("INT4_vect", 0x000A);
+            add("INT5_vect", 0x000C);
+            add("INT6_vect", 0x000E);
+            add("INT7_vect", 0x0010);
+            add("TIMER2_COMP_vect", 0x0012);
+            add("TIMER2_OVF_vect", 0x0014);
+            add("TIMER1_CAPT_vect", 0x0016);
+            add("TIMER1_COMPA_vect", 0x0018);
+            add("TIMER1_COMPB_vect", 0x001A);
+            add("TIMER1_OVF_vect", 0x001C);
+            add("TIMER0_COMP_vect", 0x001E);
+            add("TIMER0_OVF_vect", 0x0020);
+            add("SPI_STC_vect", 0x0022);
+            add("USART0_RX_vect", 0x0024);
+            add("USART0_UDRE_vect", 0x0026);
+            add("USART0_TX_vect", 0x0028);
+            add("ADC_vect", 0x002A);
+            add("EE_RDY_vect", 0x002C);
+            add("ANA_COMP_vect", 0x002E);
+            add("TIMER1_COMPC_vect", 0x0030);
+            add("TIMER3_CAPT_vect", 0x0032);
+            add("TIMER3_COMPA_vect", 0x0034);
+            add("TIMER3_COMPB_vect", 0x0036);
+            add("TIMER3_COMPC_vect", 0x0038);
+            add("TIMER3_OVF_vect", 0x003A);
+            add("USART1_RX_vect", 0x003C);
+            add("USART1_UDRE_vect", 0x003E);
+            add("USART1_TX_vect", 0x0040);
+            add("TWI_vect", 0x0042);
+            add("SPM_RDY_vect", 0x0044);
+        }
+        McuModel::Atmega328P => {
+            add("RESET_vect", 0x0000);
+            add("INT0_vect", 0x0002);
+            add("INT1_vect", 0x0004);
+            add("PCINT0_vect", 0x0006);
+            add("PCINT1_vect", 0x0008);
+            add("PCINT2_vect", 0x000A);
+            add("WDT_vect", 0x000C);
+            add("TIMER2_COMPA_vect", 0x000E);
+            add("TIMER2_COMPB_vect", 0x0010);
+            add("TIMER2_OVF_vect", 0x0012);
+            add("TIMER1_CAPT_vect", 0x0014);
+            add("TIMER1_COMPA_vect", 0x0016);
+            add("TIMER1_COMPB_vect", 0x0018);
+            add("TIMER1_OVF_vect", 0x001A);
+            add("TIMER0_COMPA_vect", 0x001C);
+            add("TIMER0_COMPB_vect", 0x001E);
+            add("TIMER0_OVF_vect", 0x0020);
+            add("SPI_STC_vect", 0x0022);
+            add("USART_RX_vect", 0x0024);
+            add("USART0_RX_vect", 0x0024);
+            add("USART_UDRE_vect", 0x0026);
+            add("USART0_UDRE_vect", 0x0026);
+            add("USART_TX_vect", 0x0028);
+            add("USART0_TX_vect", 0x0028);
+            add("ADC_vect", 0x002A);
+            add("EE_RDY_vect", 0x002C);
+            add("EE_READY_vect", 0x002C);
+            add("ANA_COMP_vect", 0x002E);
+            add("ANALOG_COMP_vect", 0x002E);
+            add("TWI_vect", 0x0030);
+            add("SPM_RDY_vect", 0x0032);
+            add("SPM_READY_vect", 0x0032);
+        }
+    }
 
     // sreg_bit_indices
     add("SREG_C", 0); add("SREG_Z", 1); add("SREG_N", 2); add("SREG_V", 3);
     add("SREG_S", 4); add("SREG_H", 5); add("SREG_T", 6); add("SREG_I", 7);
 
     // port_bit_aliases_px_n
-    for port in ['A','B','C','D','E','F','G'] {
+    let port_chars: &[char] = match model {
+        McuModel::Atmega128A => &['A', 'B', 'C', 'D', 'E', 'F', 'G'],
+        McuModel::Atmega328P => &['B', 'C', 'D'],
+    };
+    for &port in port_chars {
         for bit in 0u32..8 {
             add(&format!("P{port}{bit}"),    bit);
             add(&format!("PORT{port}{bit}"), bit);
@@ -305,7 +403,10 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
 
     // timer0_bits
     add("CS00",  0); add("CS01",  1); add("CS02",  2);
-    add("WGM01", 3); add("COM00", 4); add("COM01", 5); add("WGM00", 6); add("FOC0", 7);
+    add("WGM01", 3); add("COM00", 4); add("COM01", 5); add("WGM00", 6);
+    if model == McuModel::Atmega128A {
+        add("FOC0", 7);
+    }
 
     // timer1_bits
     // tccr1a
@@ -324,32 +425,40 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("CS20",  0); add("CS21",  1); add("CS22",  2);
     add("WGM21", 3); add("COM20", 4); add("COM21", 5); add("WGM20", 6); add("FOC2", 7);
 
-    // timer3_bits_like_t1
-    add("WGM30",  0); add("WGM31",  1);
-    add("COM3C0", 2); add("COM3C1", 3);
-    add("COM3B0", 4); add("COM3B1", 5);
-    add("COM3A0", 6); add("COM3A1", 7);
-    add("CS30",   0); add("CS31",   1); add("CS32",   2);
-    add("WGM32",  3); add("WGM33",  4);
-    add("ICES3",  6); add("ICNC3",  7);
+    if model == McuModel::Atmega128A {
+        // timer3_bits_like_t1
+        add("WGM30",  0); add("WGM31",  1);
+        add("COM3C0", 2); add("COM3C1", 3);
+        add("COM3B0", 4); add("COM3B1", 5);
+        add("COM3A0", 6); add("COM3A1", 7);
+        add("CS30",   0); add("CS31",   1); add("CS32",   2);
+        add("WGM32",  3); add("WGM33",  4);
+        add("ICES3",  6); add("ICNC3",  7);
 
-    // timsk
-    add("TOIE0", 0); add("OCIE0",  1);
+        // etimsk
+        add("TOIE3",  0); add("OCIE3B", 1); add("OCIE3A", 2); add("TICIE3", 3);
+        add("OCIE3C", 4); add("OCIE1C", 5);
+
+        // etifr
+        add("TOV3",  0); add("OCF3B", 1); add("OCF3A", 2); add("ICF3", 3);
+        add("OCF3C", 4); add("OCF1C", 5);
+    }
+
+    // timsk (legacy unified TIMSK on 128A; per-timer TIMSKn on 328P — bit names still useful)
+    add("TOIE0", 0);
+    if model == McuModel::Atmega128A {
+        add("OCIE0", 1);
+    }
     add("TOIE1", 2); add("OCIE1B", 3); add("OCIE1A", 4); add("TICIE1", 5);
-    add("TOIE2", 6); add("OCIE2",  7);
+    add("TOIE2", 6); add("OCIE2", 7);
 
     // tifr
-    add("TOV0", 0); add("OCF0",  1);
+    add("TOV0", 0);
+    if model == McuModel::Atmega128A {
+        add("OCF0", 1);
+    }
     add("TOV1", 2); add("OCF1B", 3); add("OCF1A", 4); add("ICF1", 5);
     add("TOV2", 6); add("OCF2",  7);
-
-    // etimsk
-    add("TOIE3",  0); add("OCIE3B", 1); add("OCIE3A", 2); add("TICIE3", 3);
-    add("OCIE3C", 4); add("OCIE1C", 5);
-
-    // etifr
-    add("TOV3",  0); add("OCF3B", 1); add("OCF3A", 2); add("ICF3", 3);
-    add("OCF3C", 4); add("OCF1C", 5);
 
     // spi_bits
     add("SPR0", 0); add("SPR1", 1); add("CPHA", 2); add("CPOL", 3);
@@ -367,13 +476,15 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("UCPOL0", 0); add("UCSZ00", 1); add("UCSZ01", 2); add("USBS0", 3);
     add("UPM00",  4); add("UPM01",  5); add("UMSEL0", 6);
 
-    // usart1_same_layout
-    add("MPCM1", 0); add("U2X1",  1); add("UPE1", 2); add("DOR1",  3);
-    add("FE1",   4); add("UDRE1", 5); add("TXC1", 6); add("RXC1",  7);
-    add("TXB81",  0); add("RXB81",  1); add("UCSZ12", 2); add("TXEN1",  3);
-    add("RXEN1",  4); add("UDRIE1", 5); add("TXCIE1", 6); add("RXCIE1", 7);
-    add("UCPOL1", 0); add("UCSZ10", 1); add("UCSZ11", 2); add("USBS1", 3);
-    add("UPM10",  4); add("UPM11",  5); add("UMSEL1", 6);
+    if model == McuModel::Atmega128A {
+        // usart1_same_layout
+        add("MPCM1", 0); add("U2X1",  1); add("UPE1", 2); add("DOR1",  3);
+        add("FE1",   4); add("UDRE1", 5); add("TXC1", 6); add("RXC1",  7);
+        add("TXB81",  0); add("RXB81",  1); add("UCSZ12", 2); add("TXEN1",  3);
+        add("RXEN1",  4); add("UDRIE1", 5); add("TXCIE1", 6); add("RXCIE1", 7);
+        add("UCPOL1", 0); add("UCSZ10", 1); add("UCSZ11", 2); add("USBS1", 3);
+        add("UPM10",  4); add("UPM11",  5); add("UMSEL1", 6);
+    }
 
     // adc
     // adcsra
@@ -388,8 +499,12 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("ACI",   4); add("ACO",   5); add("ACBG", 6); add("ACD",  7);
 
     // eimsk_bits
-    add("INT0", 0); add("INT1", 1); add("INT2", 2); add("INT3", 3);
-    add("INT4", 4); add("INT5", 5); add("INT6", 6); add("INT7", 7);
+    add("INT0", 0);
+    add("INT1", 1);
+    if model == McuModel::Atmega128A {
+        add("INT2", 2); add("INT3", 3);
+        add("INT4", 4); add("INT5", 5); add("INT6", 6); add("INT7", 7);
+    }
 
     // eeprom_control_bits (EECR register)
     add("EERE",  0); // read enable
@@ -407,46 +522,30 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("SRW10", 5); add("SRE",   6);
 
     if model == McuModel::Atmega328P {
-        // ATmega328P memory geometry
-        add("RAMEND",   0x08FF);
-        add("FLASHEND", 0x3FFF);
-        add("E2END",    0x03FF);
+        // t0 / EEPROM names for ATmega328P
+        add("OCIE0A", 1);
+        add("OCIE0B", 2);
+        add("OCF0A", 1);
+        add("OCF0B", 2);
+        add("WGM02", 3);
+        add("FOC0A", 7);
+        add("FOC0B", 6);
+        add("EEPE", 1);
+        add("EEMPE", 2);
 
-        // remove 128A-only ports and timer3/usart1 vectors/register aliases.
+        // remove 128A-only register aliases not present on 328P.
         for k in [
-            "pina", "ddra", "porta", "pine", "ddre", "porte", "pinf", "ddrf", "portf",
-            "ping", "ddrg", "portg",
             "icr3l", "icr3h", "ocr3cl", "ocr3ch", "ocr3bl", "ocr3bh", "ocr3al", "ocr3ah",
-            "tcnt3l", "tcnt3h", "tccr3a", "tccr3b", "tccr3c", "etimsk", "etifr",
+            "tcnt3l", "tcnt3h", "tccr3a", "tccr3b", "tccr3c",
             "ubrr1h", "ubrr1l", "ucsr1a", "ucsr1b", "ucsr1c", "udr1",
             "timer1_compc_vect", "timer3_capt_vect", "timer3_compa_vect", "timer3_compb_vect",
             "timer3_compc_vect", "timer3_ovf_vect", "usart1_rx_vect", "usart1_udre_vect",
             "usart1_tx_vect",
+            "timer0_comp_vect", "timer0_ovf_vect",
+            "timer2_comp_vect",
+            "ocf0", "ocie0", "foc0",
         ] {
             m.remove(k);
-        }
-
-        // remove port bit aliases for non-existent ports on 328P.
-        for bit in 0u32..8 {
-            m.remove(format!("pa{bit}").as_str());
-            m.remove(format!("porta{bit}").as_str());
-            m.remove(format!("ddra{bit}").as_str());
-            m.remove(format!("pina{bit}").as_str());
-
-            m.remove(format!("pe{bit}").as_str());
-            m.remove(format!("porte{bit}").as_str());
-            m.remove(format!("ddre{bit}").as_str());
-            m.remove(format!("pine{bit}").as_str());
-
-            m.remove(format!("pf{bit}").as_str());
-            m.remove(format!("portf{bit}").as_str());
-            m.remove(format!("ddrf{bit}").as_str());
-            m.remove(format!("pinf{bit}").as_str());
-
-            m.remove(format!("pg{bit}").as_str());
-            m.remove(format!("portg{bit}").as_str());
-            m.remove(format!("ddrg{bit}").as_str());
-            m.remove(format!("ping{bit}").as_str());
         }
     }
 
@@ -494,12 +593,12 @@ fn strip_comment(line: &str) -> &str {
     line.find('#').map(|i| &line[..i]).unwrap_or(line)
 }
 
-/// Split a line into an optional leading label and the remaining instruction text.
-/// Handles both `label:` (standalone) and `label: instruction` (same-line, GAS style).
+/// split a line into an optional leading label and the remaining instruction text
+/// handles both `label:` (standalone) and `label: instruction` (same-line, GAS style)
 fn split_label_instr(line: &str) -> (Option<&str>, &str) {
     if let Some(colon) = line.find(':') {
         let before = &line[..colon];
-        // Label must be a non-empty identifier token (no whitespace inside)
+        // label must be a non-empty identifier token (no whitespace inside)
         if !before.is_empty() && !before.contains(|c: char| c.is_whitespace()) {
             let rest = line[colon + 1..].trim();
             return (Some(before.trim()), rest);
@@ -509,12 +608,12 @@ fn split_label_instr(line: &str) -> (Option<&str>, &str) {
 }
 
 
-/// Rewrite local numeric GAS labels (`1:`, `2:`, …) to unique internal names,
-/// and replace all `Nb` / `Nf` references accordingly.
+/// rewrite local numeric GAS labels (`1:`, `2:`, …) to unique internal names,
+/// and replace all `Nb` / `Nf` references
 fn normalize_local_labels(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
 
-    // Pass 1: number each `N:` occurrence → unique name __L{digit}_{idx}
+    // pass 1: number each `N:` occurrence → unique name __L{digit}_{idx}
     // local_defs[digit] = Vec<(line_index, unique_name)>
     let mut local_defs: std::collections::HashMap<u32, Vec<(usize, String)>> = Default::default();
     let mut counters:   std::collections::HashMap<u32, usize>                 = Default::default();
@@ -538,7 +637,7 @@ fn normalize_local_labels(source: &str) -> String {
         return source.to_string();
     }
 
-    // Build reverse map: line_idx → unique_name (for renaming label definitions)
+    // build reverse map: line_idx → unique_name (for renaming label definitions)
     let mut def_at_line: std::collections::HashMap<usize, &str> = Default::default();
     for def_list in local_defs.values() {
         for (ln, name) in def_list {
@@ -546,10 +645,10 @@ fn normalize_local_labels(source: &str) -> String {
         }
     }
 
-    // Pass 2: rewrite lines — rename label defs AND Nb/Nf refs
+    // pass 2: rewrite lines — rename label defs AND Nb/Nf refs
     let mut out = String::with_capacity(source.len() + 64);
     for (ln, raw) in lines.iter().enumerate() {
-        // If this line has a local numeric label definition, rename it first.
+        // if this line has a local numeric label definition, rename it first.
         let owned;
         let working = if let Some(&uname) = def_at_line.get(&ln) {
             let stripped = strip_comment(raw).trim();
@@ -574,7 +673,7 @@ fn normalize_local_labels(source: &str) -> String {
         out.push_str(&new_line);
         out.push('\n');
     }
-    // Remove the trailing newline we added (preserve original ending)
+    // remove the trailing newline we added (preserve original ending)
     if !source.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
@@ -591,8 +690,8 @@ fn rewrite_local_refs(
     let mut i = 0;
 
     while i < b.len() {
-        // Detect a potential local-label reference: digit(s) followed by 'b' or 'f',
-        // not preceded by an alphanumeric/underscore char (word boundary).
+        // detect a potential local-label reference: digit(s) followed by 'b' or 'f'
+        // not preceded by an alphanumeric/underscore char (word boundary)
         let prev_word = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
         if !prev_word && b[i].is_ascii_digit() {
             let start = i;
@@ -662,7 +761,6 @@ fn instruction_words(line: &str) -> u32 {
 }
 
 // encoder
-
 fn encode(
     line:    &str,
     cur:     u32,
@@ -1018,7 +1116,6 @@ fn encode(
 }
 
 // pointer_addressing
-
 #[derive(Clone, Copy)]
 enum Ptr {
     X, Xp, Xm,
@@ -1148,7 +1245,6 @@ fn imm_u8_sym(
 }
 
 // expression evaluator: handles (1 << N) | ... operands
-
 #[derive(Clone, Debug)]
 enum ExprTok {
     Num(u32),
@@ -1480,13 +1576,32 @@ mod tests {
 
     #[test]
     fn asm_sbi_portb() {
-        // regression sbi_portb5→io18_b5
+        // ATmega128A: PORTB at I/O 0x18
         let words = assemble("SBI PORTB, 5").unwrap();
         assert_eq!(words.len(), 1);
         let op = words[0];
         assert_eq!(op & 0xFF00, 0x9A00);  // sbi_opc
         assert_eq!((op >> 3) & 0x1F, 0x18); // io_18_portb
         assert_eq!(op & 0x07, 5);           // bit5
+    }
+
+    #[test]
+    fn asm_328p_sbi_portb5_uno_led() {
+        let words = assemble_for_model("SBI PORTB, 5", McuModel::Atmega328P).unwrap();
+        assert_eq!(words.len(), 1);
+        let op = words[0];
+        assert_eq!(op & 0xFF00, 0x9A00);
+        assert_eq!((op >> 3) & 0x1F, 0x05, "PORTB I/O 0x05 on ATmega328P");
+        assert_eq!(op & 0x07, 5);
+    }
+
+    #[test]
+    fn asm_328p_out_ddrb() {
+        let words = assemble_for_model("OUT DDRB, R16", McuModel::Atmega328P).unwrap();
+        let op = words[0];
+        assert_eq!(op & 0xF800, 0xB800);
+        let a = (((op >> 5) & 0x30) | (op & 0x0F)) as u8;
+        assert_eq!(a, 0x04, "DDRB I/O 0x04 on ATmega328P");
     }
 
     #[test]
