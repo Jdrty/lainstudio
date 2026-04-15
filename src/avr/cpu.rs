@@ -9,8 +9,8 @@ use super::{io_map, McuModel};
 pub const FLASH_WORDS: usize = 65_536;
 pub const FLASH_WORDS_128A: usize = 65_536;
 pub const FLASH_WORDS_328P: usize = 16_384;
-const SRAM_BYTES_128A: usize = 4_096;
-const SRAM_BYTES_328P: usize = 2_048;
+const SRAM_BYTES_128A: usize = 4_096; // 0x0100–0x10FF
+const SRAM_BYTES_328P: usize = 2_048; // 0x0100–0x08FF
 const IO_SIZE: usize = 0x00E0; // data_mem 0x0020–0x00FF
 const EEPROM_BYTES_128A: usize = 4_096;
 const EEPROM_BYTES_328P: usize = 1_024;
@@ -49,6 +49,10 @@ pub struct Cpu {
     timer_last_cycles: u64,
     /// eemwe auto-clear countdown: EEMWE clears after 4 instructions if EEWE not triggered
     eemwe_timer: u8,
+    /// Pin read overrides for inputs: `(PIN register data address, bit, pin level: true = reads high)`.
+    pin_input_override: Vec<(u16, u8, bool)>,
+    /// Millivolts 0–5000 per ADC channel (from virtual potentiometers); `None` = 0 V.
+    adc_channel_mv: [Option<u32>; 16],
 }
 
 impl Default for Cpu { fn default() -> Self { Self::new() } }
@@ -77,6 +81,8 @@ impl Cpu {
             cycles: 0,
             timer_last_cycles: 0,
             eemwe_timer: 0,
+            pin_input_override: Vec::new(),
+            adc_channel_mv: [None; 16],
         }
     }
 
@@ -131,9 +137,10 @@ impl Cpu {
         self.cycles            = 0;
         self.timer_last_cycles = 0;
         self.eemwe_timer       = 0;
+        self.pin_input_override.clear();
+        self.adc_channel_mv = [None; 16];
     }
 
-    /// Resize external SRAM. `size == 0` disables XMEM.
     pub fn configure_xmem(&mut self, size: u32) {
         if !self.has_xmem() {
             self.xmem.clear();
@@ -155,7 +162,7 @@ impl Cpu {
 
     // memory_access
 
-    pub fn read_mem(&self, addr: u16) -> u8 {
+    pub fn read_mem_raw(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x001F => self.regs[addr as usize],
             0x0020..=0x00FF => match addr {
@@ -179,6 +186,113 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    fn apply_pin_input_overrides(&self, addr: u16, v: &mut u8) {
+        for &(pin_addr, bit, high) in &self.pin_input_override {
+            if pin_addr != addr {
+                continue;
+            }
+            let ddr_addr = pin_addr.wrapping_add(1);
+            if ddr_addr < 0x0020 || ddr_addr > 0x00FF {
+                continue;
+            }
+            let ddr_val = self.read_mem_raw(ddr_addr);
+            if (ddr_val >> bit) & 1 != 0 {
+                continue; // output: peripheral does not override
+            }
+            *v = (*v & !(1 << bit)) | ((high as u8) << bit);
+        }
+    }
+
+    pub fn peek_mem(&self, addr: u16) -> u8 {
+        let mut v = self.read_mem_raw(addr);
+        self.apply_pin_input_overrides(addr, &mut v);
+        v
+    }
+
+    pub fn clear_peripheral_inputs(&mut self) {
+        self.pin_input_override.clear();
+        self.adc_channel_mv = [None; 16];
+    }
+
+    pub fn add_pin_input_override(&mut self, pin_addr: u16, bit: u8, high: bool) {
+        self.pin_input_override.push((pin_addr, bit, high));
+    }
+
+    pub fn set_adc_channel_mv(&mut self, channel: u8, mv: u32) {
+        let i = (channel as usize).min(15);
+        self.adc_channel_mv[i] = Some(mv.min(5000));
+    }
+
+    fn adc_io_addrs(&self) -> (u16, u16, u16, u16) {
+        match self.model {
+            McuModel::Atmega128A => (
+                io_map::ADCL,
+                io_map::ADCH,
+                io_map::ADMUX,
+                io_map::ADCSRA,
+            ),
+            McuModel::Atmega328P => (0x0078, 0x0079, 0x007C, 0x007A),
+        }
+    }
+
+    fn adc_mux_to_channel_idx(&self, mux: u8) -> usize {
+        match self.model {
+            McuModel::Atmega328P => {
+                let adcsrb = self.io[(0x007Bu16.wrapping_sub(0x0020)) as usize];
+                let mux5 = adcsrb & 0x08 != 0;
+                if mux5 {
+                    8usize + (mux as usize & 0x07)
+                } else {
+                    (mux as usize & 0x0F).min(15)
+                }
+            }
+            McuModel::Atmega128A => (mux & 0x07) as usize,
+        }
+    }
+
+    fn try_complete_adc_conversion_if_busy(&mut self) {
+        let (adcl, adch, admux, adcsra) = self.adc_io_addrs();
+        let idx_csra = (adcsra.wrapping_sub(0x0020)) as usize;
+        if self.io[idx_csra] & 0x80 == 0 {
+            return; // ADEN clear
+        }
+        if self.io[idx_csra] & 0x40 == 0 {
+            return; // ADSC clear — idle or already latched
+        }
+        let mux = self.io[(admux.wrapping_sub(0x0020)) as usize];
+        let ch = self.adc_mux_to_channel_idx(mux);
+        let mv = self.adc_channel_mv[ch].unwrap_or(0);
+        let v10 = ((mv as u64 * 1023) / 5000).min(1023) as u16;
+        let adlar = mux & 0x20 != 0;
+        let idx_adcl = (adcl.wrapping_sub(0x0020)) as usize;
+        let idx_adch = (adch.wrapping_sub(0x0020)) as usize;
+        if !adlar {
+            self.io[idx_adcl] = v10 as u8;
+            self.io[idx_adch] = (v10 >> 8) as u8 & 0x03;
+        } else {
+            self.io[idx_adch] = (v10 >> 2) as u8;
+            self.io[idx_adcl] = ((v10 & 0x03) << 6) as u8;
+        }
+        self.io[idx_csra] &= !0x40; // clear ADSC
+    }
+
+    fn maybe_complete_adc_on_read(&mut self, addr: u16) {
+        let (adcl, adch, _, _) = self.adc_io_addrs();
+        if addr != adcl && addr != adch {
+            return;
+        }
+        self.try_complete_adc_conversion_if_busy();
+    }
+
+    pub fn read_mem(&mut self, addr: u16) -> u8 {
+        let (_, _, _, adcsra) = self.adc_io_addrs();
+        if addr == adcsra {
+            self.try_complete_adc_conversion_if_busy();
+        }
+        self.maybe_complete_adc_on_read(addr);
+        self.peek_mem(addr)
     }
 
     pub fn write_mem(&mut self, addr: u16, val: u8) {
@@ -210,7 +324,6 @@ impl Cpu {
     }
 
     // eeprom_peripheral
-    /// handle a write to the EECR register, emulating the ATmega128A EEPROM controller.
     fn eecr_write(&mut self, val: u8) {
         let idx = (io_map::EECR - 0x0020) as usize;
         let old = self.io[idx];

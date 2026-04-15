@@ -10,55 +10,42 @@ use std::thread;
 
 use eframe::egui::{
     self, Align2, Color32, ComboBox, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Id, Margin, RichText, Stroke, TextStyle, TopBottomPanel, Visuals, Window,
+    Frame, Id, Key, Margin, Modifiers, RichText, Stroke, TextStyle, TopBottomPanel, ViewportCommand,
+    Visuals, Window,
 };
 
-use crate::boot_video::BootVideo;
-use crate::ed060sc4_display::Ed060sc4Display;
 use crate::avr::assembler::assemble_for_model;
 use crate::avr::cpu::StepResult;
 use crate::avr::intel_hex::{self, validate_intel_hex};
+use crate::avr::parse_board_from_source;
 use crate::avr::McuModel;
 use crate::avr::Cpu;
 use crate::editor::TextEditor;
-use crate::docs::{show_flash_locations_window, show_isa_window};
+use crate::docs::show_flash_locations_window;
 use crate::cycle_helper::{show_cycle_helper, CycleHelperState};
+use crate::peripherals::{
+    apply_peripherals_to_cpu, load_peripherals_from_disk, on_peripherals_panel_hidden,
+    show_peripherals_panel, PeripheralState,
+};
 use crate::sim_panel::{
     show_sim_panel, BreakpointState, BpAction, FlashState, SimAction, SimTab,
-    SpeedLimitState, StackState, XmemState, XMEM_MAX,
+    SpeedLimitState, StackState, XmemState,
 };
 use crate::toolbar::{show_toolbar, ToolbarAction};
 use crate::upload_panel::{scan_serial_ports, show_upload_panel, UploadAction};
 use crate::word_helper::{show_word_helper, WordHelperState};
-use crate::welcome::{
-    show_create_project, show_welcome, CreateProjectAction, WelcomeAction, START_GREEN,
-    START_GREEN_DIM,
+use crate::modal_chrome::{
+    modal_body, modal_btn_danger, modal_btn_primary, modal_btn_secondary, modal_caption,
+    modal_error, modal_single_line_edit, modal_title, modal_window_frame,
 };
-use crate::welcome_font;
+use crate::theme;
+use crate::waveforms::{
+    on_waveforms_panel_hidden, show_waveforms_panel, WaveformAction, WaveformState,
+};
+use crate::theme::{START_GREEN, START_GREEN_DIM};
 
 /// Written by “Assemble and Link”; consumed by avrdude.
 const FIRMWARE_HEX: &str = "firmware.hex";
-
-/// Initial `.lain` for new ATmega328P projects: Uno built-in LED is **PB5** → bitmask **0x20** (not 0x01 = PB0 / D8).
-const NEW_PROJECT_LAIN_ATMEGA328P: &str = r#".cseg
-; Arduino Uno built-in LED = PB5 (digital pin 13). Mask 0x20 = 1 << 5.  (0x01 would toggle PB0 / pin 8.)
-    EOR  R17, R17
-    LDI  R16, 0x20
-    OUT  DDRB, R16
-loop:
-    EOR  R17, R16
-    OUT  PORTB, R17
-    LDI  R18, 40
-outer: LDI  R19, 255
-mid:   LDI  R20, 255
-inner: DEC  R20
-       BRNE inner
-       DEC  R19
-       BRNE mid
-       DEC  R18
-       BRNE outer
-    RJMP loop
-"#;
 
 pub fn setup_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -78,10 +65,9 @@ pub fn setup_style(ctx: &egui::Context) {
         stack.insert(0, "iosevka_term".to_owned());
     }
     fonts.families.insert(
-        FontFamily::Name("lain_title".into()),
+        FontFamily::Name("fm_title".into()),
         vec!["orbitron_title".to_owned()],
     );
-    welcome_font::setup(&mut fonts);
     ctx.set_fonts(fonts);
 
     let mut visuals = Visuals::dark();
@@ -128,6 +114,9 @@ pub fn setup_style(ctx: &egui::Context) {
             .insert(TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace));
     });
 
+    // Cmd+/− zoom applies only to the editor (see `TextEditor::apply_editor_zoom_keyboard`).
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
     // egui_embedded_png_bytes
     egui_extras::install_image_loaders(ctx);
 }
@@ -135,25 +124,13 @@ pub fn setup_style(ctx: &egui::Context) {
 pub struct Workspace {
     pub root: PathBuf,
     pub active_file: Option<PathBuf>,
-    pub model: McuModel,
-}
-
-enum AppPhase {
-    Welcome,
-    CreateProject {
-        parent_dir: Option<PathBuf>,
-        name: String,
-        model: McuModel,
-        err: Option<String>,
-    },
-    Editor {
-        workspace: Workspace,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileExtension {
-    Lain,
+    Fm,
+    Asm,
+    Gas, // .S
     H,
     Md,
     Txt,
@@ -162,7 +139,9 @@ enum FileExtension {
 impl FileExtension {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Lain => "lain",
+            Self::Fm => "fm",
+            Self::Asm => "asm",
+            Self::Gas => "S",
             Self::H => "h",
             Self::Md => "md",
             Self::Txt => "txt",
@@ -171,7 +150,9 @@ impl FileExtension {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Lain => ".lain",
+            Self::Fm => ".fm",
+            Self::Asm => ".asm",
+            Self::Gas => ".S",
             Self::H => ".h",
             Self::Md => ".md",
             Self::Txt => ".txt",
@@ -193,6 +174,10 @@ enum ModalState {
     ConfirmOpenFolder {
         err: Option<String>,
     },
+    /// Window close while buffer is dirty.
+    ConfirmQuit {
+        err: Option<String>,
+    },
     /// macOS: avrdude missing after Upload — offer Homebrew install (may chain silent Homebrew).
     InstallAvrdudeHomebrew,
 }
@@ -202,9 +187,8 @@ struct StatusMessage {
     is_error: bool,
 }
 
-pub struct LainApp {
-    boot_video: BootVideo,
-    phase: AppPhase,
+pub struct FullMetalApp {
+    workspace: Workspace,
     editor: TextEditor,
     modal: ModalState,
     status: Option<StatusMessage>,
@@ -212,7 +196,6 @@ pub struct LainApp {
     show_sim: bool,
     sim_tab: SimTab,
     sim_last_result: Option<StepResult>,
-    show_isa: bool,
     flash_state: FlashState,
     show_flash_locations: bool,
     show_word_helper: bool,
@@ -221,11 +204,6 @@ pub struct LainApp {
     cycle_helper_state: CycleHelperState,
     stack_state: StackState,
     xmem_state:  XmemState,
-    /// ED060SC4 panel helper (ATmega128A only): max XMEM + purple PORTS highlights + EINK tab.
-    ed060sc4_sim: bool,
-    ed060_display: Ed060sc4Display,
-    /// Persisted; when true, `fake.mov` boot is skipped on next launch.
-    skip_start_animation: bool,
     speed_limit: SpeedLimitState,
     breakpoints: BreakpointState,
     // auto_run_state
@@ -236,6 +214,14 @@ pub struct LainApp {
     // token-bucket for the IPS speed limiter (wall-clock based, not frame-dt)
     limit_clock:      std::time::Instant,
     limit_steps_done: u64,
+    /// `limit_ips().map(f64::to_bits)` — when the dial/units change, reset the bucket so lowering IPS does not “freeze” AUTO.
+    last_limit_ips_bits: Option<u64>,
+    /// right panel: virtual GPIO / ADC peripherals
+    show_peripherals: bool,
+    peripheral_state: PeripheralState,
+    /// right panel: waveform traces
+    show_waveforms: bool,
+    waveform_state: WaveformState,
     /// right panel: firmware hex + avrdude (replaces SIM / helpers while open)
     show_upload: bool,
     upload_programmer: String,
@@ -244,18 +230,20 @@ pub struct LainApp {
     upload_port_custom: bool,
     upload_status_line: String,
     upload_job_rx: Option<Receiver<String>>,
+    /// Set only after a successful assemble (Sim or Assemble and Link) with a valid `.board` in source.
+    assembled_board: Option<McuModel>,
 }
 
-impl LainApp {
+impl FullMetalApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_style(&cc.egui_ctx);
-        let skip_start_animation = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "skip_start_animation"))
-            .unwrap_or(false);
-        Self {
-            boot_video: BootVideo::new(skip_start_animation),
-            phase: AppPhase::Welcome,
+        let root = scratch_workspace_root();
+        let _ = fs::create_dir_all(&root);
+        let mut app = Self {
+            workspace: Workspace {
+                root,
+                active_file: None,
+            },
             editor: TextEditor::new(Id::new("main_editor")),
             modal: ModalState::None,
             status: None,
@@ -263,7 +251,6 @@ impl LainApp {
             show_sim: false,
             sim_tab: SimTab::Cpu,
             sim_last_result: None,
-            show_isa: false,
             flash_state: FlashState::default(),
             show_flash_locations: false,
             show_word_helper: false,
@@ -272,8 +259,6 @@ impl LainApp {
             cycle_helper_state: CycleHelperState::default(),
             stack_state: StackState::default(),
             xmem_state:  XmemState::default(),
-            ed060sc4_sim: false,
-            ed060_display: Ed060sc4Display::default(),
             speed_limit: SpeedLimitState::default(),
             breakpoints: BreakpointState::default(),
             auto_running: false,
@@ -282,25 +267,33 @@ impl LainApp {
             ips_sample_steps: 0,
             limit_clock:      std::time::Instant::now(),
             limit_steps_done: 0,
+            last_limit_ips_bits: None,
+            show_peripherals: false,
+            peripheral_state: PeripheralState::default(),
+            show_waveforms: false,
+            waveform_state: WaveformState::default(),
             show_upload: false,
             upload_programmer: "arduino".to_string(),
             upload_port: String::new(),
             upload_port_custom: false,
             upload_status_line: String::new(),
             upload_job_rx: None,
-            skip_start_animation,
-        }
+            assembled_board: None,
+        };
+        app.reset_simulator_for_workspace(McuModel::Atmega328P);
+        app
     }
 
-    /// return (filename, content) pairs for all .lain files in the workspace root
-    fn collect_lain_files(&self) -> Vec<(String, String)> {
-        let Some(ws) = self.current_workspace() else { return vec![]; };
+    /// (filename, content) for supported assembly sources in the workspace root (non-recursive).
+    fn collect_asm_files(&self) -> Vec<(String, String)> {
+        let ws = &self.workspace;
         let Ok(entries) = std::fs::read_dir(&ws.root) else { return vec![]; };
         let mut out = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("lain") {
-                let name = path.file_name()
+            if path.is_file() && is_supported_text_file(&path) {
+                let name = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("?")
                     .to_string();
@@ -313,18 +306,8 @@ impl LainApp {
         out
     }
 
-    fn current_workspace(&self) -> Option<&Workspace> {
-        match &self.phase {
-            AppPhase::Editor { workspace } => Some(workspace),
-            _ => None,
-        }
-    }
-
-    fn current_workspace_mut(&mut self) -> Option<&mut Workspace> {
-        match &mut self.phase {
-            AppPhase::Editor { workspace } => Some(workspace),
-            _ => None,
-        }
+    fn mcu_model_from_editor(&self) -> McuModel {
+        parse_board_from_source(self.editor.source()).unwrap_or(McuModel::Atmega328P)
     }
 
     fn set_status(&mut self, text: impl Into<String>) {
@@ -341,21 +324,29 @@ impl LainApp {
         });
     }
 
-    fn ed060_port_driven(&self) -> bool {
-        matches!(
-            &self.phase,
-            AppPhase::Editor { workspace }
-                if workspace.model == McuModel::Atmega128A && self.ed060sc4_sim
-        )
-    }
-
-    fn drive_ed060_from_cpu(&mut self) {
-        let on = self.ed060_port_driven();
-        let cpu = &self.sim;
-        self.ed060_display.drive_from_cpu(cpu, on);
+    fn reset_simulator_for_workspace(&mut self, model: McuModel) {
+        self.sim = Cpu::new_for_model(model);
+        self.speed_limit = SpeedLimitState::default();
+        self.last_limit_ips_bits = None;
+        self.limit_clock = std::time::Instant::now();
+        self.limit_steps_done = 0;
+        self.auto_running = false;
+        self.ips = 0.0;
+        self.ips_sample_start = std::time::Instant::now();
+        self.ips_sample_steps = 0;
+        self.breakpoints = BreakpointState::default();
+        self.flash_state = FlashState::default();
+        self.stack_state = StackState::default();
+        self.xmem_state = XmemState::default();
+        self.sim_last_result = None;
+        self.sim_tab = SimTab::Cpu;
+        self.waveform_state = WaveformState::default();
+        self.show_waveforms = false;
     }
 
     fn enter_editor(&mut self, workspace: Workspace) {
+        self.assembled_board = None;
+        let root = workspace.root.clone();
         let load_result = workspace
             .active_file
             .as_ref()
@@ -372,41 +363,38 @@ impl LainApp {
                 self.set_error(err);
             }
         }
-        self.sim = Cpu::new_for_model(workspace.model);
-        self.ed060sc4_sim = false;
-        self.ed060_display = Ed060sc4Display::default();
-        self.phase = AppPhase::Editor { workspace };
+        let model = parse_board_from_source(self.editor.source()).unwrap_or(McuModel::Atmega328P);
+        self.reset_simulator_for_workspace(model);
+        self.peripheral_state = load_peripherals_from_disk(&root);
+        self.workspace = workspace;
         self.modal = ModalState::None;
     }
 
     fn open_workspace(&mut self, root: PathBuf) {
-        let model = ensure_workspace_model_marker(&root).unwrap_or(McuModel::Atmega328P);
         let active_file = find_first_supported_file(&root);
-        self.enter_editor(Workspace { root, active_file, model });
+        self.enter_editor(Workspace { root, active_file });
         self.set_status("Opened folder.");
     }
 
     fn switch_active_file(&mut self, path: PathBuf) -> Result<String, String> {
-        if self.editor.is_dirty() && self.current_workspace().and_then(|w| w.active_file.as_ref()).is_some() {
+        self.assembled_board = None;
+        if self.editor.is_dirty() && self.workspace.active_file.is_some() {
             self.save_current_file()?;
         }
         let contents = read_text_file(&path)?;
-        if let Some(workspace) = self.current_workspace_mut() {
-            workspace.active_file = Some(path.clone());
-        }
+        self.workspace.active_file = Some(path.clone());
         self.editor.set_source(contents);
+        let model = parse_board_from_source(self.editor.source()).unwrap_or(McuModel::Atmega328P);
+        self.reset_simulator_for_workspace(model);
         self.editor.focus_next_frame();
         Ok(format!("Opened {}", path.display()))
     }
 
     fn source_for_assembly(&self) -> Result<String, String> {
-        let workspace = self
-            .current_workspace()
-            .ok_or_else(|| "No workspace is open.".to_string())?;
-        let active = workspace
-            .active_file
-            .as_ref()
-            .ok_or_else(|| "No active file selected. Use File > New file first.".to_string())?;
+        let workspace = &self.workspace;
+        let Some(active) = workspace.active_file.as_ref() else {
+            return Ok(self.editor.source().to_string());
+        };
         expand_source_with_includes(workspace, active, self.editor.source())
     }
 
@@ -414,12 +402,10 @@ impl LainApp {
         if self.editor.is_dirty() {
             self.save_current_file()?;
         }
-        let workspace = self
-            .current_workspace()
-            .ok_or_else(|| "No workspace is open.".to_string())?;
-        let model = workspace.model;
+        let workspace = &self.workspace;
+        let model = self.mcu_model_from_editor();
         let source = self.source_for_assembly()?;
-        let words = assemble_for_model(&source, model).map_err(|errs| {
+        let words = assemble_for_model(&source).map_err(|errs| {
             errs.iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
@@ -438,6 +424,7 @@ impl LainApp {
             flash_words,
             app_words * 2
         );
+        self.assembled_board = Some(model);
         Ok(())
     }
 
@@ -513,10 +500,7 @@ impl LainApp {
     }
 
     fn spawn_avrdude_upload(&mut self) {
-        let Some(ws) = self.current_workspace() else {
-            self.upload_status_line = "Error: no workspace open.".to_string();
-            return;
-        };
+        let ws = &self.workspace;
         let hex_path = ws.root.join(FIRMWARE_HEX);
         if !hex_path.is_file() {
             self.upload_status_line = format!("Error: {} not found. Run Assemble and Link first.", hex_path.display());
@@ -527,7 +511,7 @@ impl LainApp {
             return;
         }
 
-        let part = ws.model.avrdude_part().to_string();
+        let part = self.mcu_model_from_editor().avrdude_part().to_string();
         let prog = self.upload_programmer.trim().to_string();
         let port = self.upload_port.trim().to_string();
         if prog.is_empty() {
@@ -697,12 +681,26 @@ impl LainApp {
     }
 
     fn save_current_file(&mut self) -> Result<String, String> {
-        let path = self
-            .current_workspace()
-            .and_then(|workspace| workspace.active_file.clone())
-            .ok_or_else(|| "No active file selected. Use File > New file first.".to_string())?;
-
-        fs::write(&path, self.editor.source()).map_err(|err| err.to_string())?;
+        if let Some(path) = self.workspace.active_file.clone() {
+            fs::write(&path, self.editor.source()).map_err(|err| err.to_string())?;
+            self.editor.mark_saved();
+            self.editor.focus_next_frame();
+            return Ok(format!("Saved {}", path.display()));
+        }
+        let path = rfd::FileDialog::new()
+            .set_title("Save as")
+            .add_filter("Assembly", &["fm", "asm", "s"])
+            .save_file()
+            .ok_or_else(|| "Save cancelled.".to_string())?;
+        fs::write(&path, self.editor.source()).map_err(|e| e.to_string())?;
+        self.workspace.root = path
+            .parent()
+            .unwrap_or_else(|| self.workspace.root.as_path())
+            .to_path_buf();
+        self.workspace.active_file = Some(path.clone());
+        let model = parse_board_from_source(self.editor.source()).unwrap_or(McuModel::Atmega328P);
+        self.reset_simulator_for_workspace(model);
+        self.peripheral_state = load_peripherals_from_disk(&self.workspace.root);
         self.editor.mark_saved();
         self.editor.focus_next_frame();
         Ok(format!("Saved {}", path.display()))
@@ -733,10 +731,7 @@ impl LainApp {
 
     fn create_new_dir(&mut self, name: &str) -> Result<String, String> {
         let name = validate_leaf_name(name)?;
-        let root = self
-            .current_workspace()
-            .map(|workspace| workspace.root.clone())
-            .ok_or_else(|| "No workspace is open.".to_string())?;
+        let root = self.workspace.root.clone();
 
         let dir_path = root.join(name);
         if dir_path.exists() {
@@ -755,14 +750,11 @@ impl LainApp {
     ) -> Result<String, String> {
         let name = validate_leaf_name(name)?;
 
-        if self.editor.is_dirty() && self.current_workspace().and_then(|w| w.active_file.as_ref()).is_some() {
+        if self.editor.is_dirty() && self.workspace.active_file.is_some() {
             self.save_current_file()?;
         }
 
-        let root = self
-            .current_workspace()
-            .map(|workspace| workspace.root.clone())
-            .ok_or_else(|| "No workspace is open.".to_string())?;
+        let root = self.workspace.root.clone();
 
         let path = root.join(format!("{name}.{}", extension.as_str()));
         if path.exists() {
@@ -770,19 +762,15 @@ impl LainApp {
         }
 
         fs::write(&path, "").map_err(|err| err.to_string())?;
-        if let Some(workspace) = self.current_workspace_mut() {
-            workspace.active_file = Some(path.clone());
-        }
+        self.workspace.active_file = Some(path.clone());
         self.editor.set_source(String::new());
+        self.assembled_board = None;
         self.editor.focus_next_frame();
         Ok(format!("Created {}", path.display()))
     }
 
     fn add_file_to_project(&mut self) -> Result<String, String> {
-        let root = self
-            .current_workspace()
-            .map(|workspace| workspace.root.clone())
-            .ok_or_else(|| "No workspace is open.".to_string())?;
+        let root = self.workspace.root.clone();
 
         let Some(source_path) = rfd::FileDialog::new()
             .set_title("Add file to project")
@@ -802,11 +790,12 @@ impl LainApp {
         fs::copy(&source_path, &dest_path).map_err(|err| err.to_string())?;
 
         if is_supported_text_file(&dest_path) {
+            self.assembled_board = None;
             let contents = read_text_file(&dest_path)?;
-            if let Some(workspace) = self.current_workspace_mut() {
-                workspace.active_file = Some(dest_path.clone());
-            }
+            self.workspace.active_file = Some(dest_path.clone());
             self.editor.set_source(contents);
+            let model = parse_board_from_source(self.editor.source()).unwrap_or(McuModel::Atmega328P);
+            self.reset_simulator_for_workspace(model);
             self.editor.focus_next_frame();
         }
 
@@ -827,7 +816,7 @@ impl LainApp {
             ToolbarAction::NewFile => {
                 self.modal = ModalState::NewFile {
                     name: String::new(),
-                    extension: FileExtension::Lain,
+                    extension: FileExtension::Fm,
                     err: None,
                 };
             }
@@ -848,7 +837,29 @@ impl LainApp {
                 self.show_sim = !self.show_sim;
                 if self.show_sim {
                     self.show_upload = false;
+                    self.show_peripherals = false;
+                    self.show_waveforms = false;
                     self.show_word_helper  = false;
+                    self.show_cycle_helper = false;
+                }
+            }
+            ToolbarAction::PeripheralsTogglePanel => {
+                self.show_peripherals = !self.show_peripherals;
+                if self.show_peripherals {
+                    self.show_sim = false;
+                    self.show_upload = false;
+                    self.show_waveforms = false;
+                    self.show_word_helper = false;
+                    self.show_cycle_helper = false;
+                }
+            }
+            ToolbarAction::WaveformsTogglePanel => {
+                self.show_waveforms = !self.show_waveforms;
+                if self.show_waveforms {
+                    self.show_sim = false;
+                    self.show_upload = false;
+                    self.show_peripherals = false;
+                    self.show_word_helper = false;
                     self.show_cycle_helper = false;
                 }
             }
@@ -856,12 +867,11 @@ impl LainApp {
                 self.show_upload = !self.show_upload;
                 if self.show_upload {
                     self.show_sim = false;
+                    self.show_peripherals = false;
+                    self.show_waveforms = false;
                     self.show_word_helper = false;
                     self.show_cycle_helper = false;
                 }
-            }
-            ToolbarAction::DocsInstructionSet => {
-                self.show_isa = true;
             }
             ToolbarAction::DocsFlashLocations => {
                 self.show_flash_locations = true;
@@ -870,6 +880,8 @@ impl LainApp {
                 self.show_word_helper = !self.show_word_helper;
                 if self.show_word_helper {
                     self.show_sim          = false;
+                    self.show_peripherals = false;
+                    self.show_waveforms = false;
                     self.show_upload = false;
                     self.show_cycle_helper = false;
                 }
@@ -878,6 +890,8 @@ impl LainApp {
                 self.show_cycle_helper = !self.show_cycle_helper;
                 if self.show_cycle_helper {
                     self.show_sim         = false;
+                    self.show_peripherals = false;
+                    self.show_waveforms = false;
                     self.show_upload = false;
                     self.show_word_helper = false;
                 }
@@ -893,6 +907,8 @@ impl LainApp {
             CreateFile(String, FileExtension),
             SaveThenOpenFolder,
             DiscardThenOpenFolder,
+            SaveThenQuit,
+            DiscardThenQuit,
             RunAvrdudeHomebrewInstall,
         }
 
@@ -901,34 +917,33 @@ impl LainApp {
         match &mut self.modal {
             ModalState::None => {}
             ModalState::NewDir { name, err } => {
-                Window::new("New dir")
+                Window::new("New directory")
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .collapsible(false)
                     .resizable(false)
-                    .frame(
-                        Frame::NONE
-                            .fill(Color32::from_rgb(3, 8, 3))
-                            .stroke(Stroke::new(1.5, START_GREEN_DIM))
-                            .corner_radius(CornerRadius::ZERO)
-                            .inner_margin(Margin::same(14)),
-                    )
+                    .frame(modal_window_frame())
                     .show(ctx, |ui| {
-                        ui.label("Create a new directory under the current project.");
-                        ui.add_space(8.0);
-                        ui.label("Directory name");
-                        ui.text_edit_singleline(name);
+                        modal_title(ui, "New directory");
+                        ui.add_space(6.0);
+                        modal_body(
+                            ui,
+                            "Create a new directory under the current project.",
+                        );
+                        ui.add_space(10.0);
+                        modal_caption(ui, "Directory name");
+                        ui.add_space(4.0);
+                        modal_single_line_edit(ui, name);
 
                         if let Some(message) = err.as_ref() {
                             ui.add_space(8.0);
-                            ui.colored_label(Color32::from_rgb(255, 140, 140), message);
+                            modal_error(ui, message);
                         }
 
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
+                            if modal_btn_secondary(ui, "Cancel").clicked() {
                                 action = ModalAction::Close;
-                            }
-                            if ui.button("Create").clicked() {
+                            } else if modal_btn_primary(ui, "Create").clicked() {
                                 action = ModalAction::CreateDir(name.clone());
                             }
                         });
@@ -943,104 +958,132 @@ impl LainApp {
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .collapsible(false)
                     .resizable(false)
-                    .frame(
-                        Frame::NONE
-                            .fill(Color32::from_rgb(3, 8, 3))
-                            .stroke(Stroke::new(1.5, START_GREEN_DIM))
-                            .corner_radius(CornerRadius::ZERO)
-                            .inner_margin(Margin::same(14)),
-                    )
+                    .frame(modal_window_frame())
                     .show(ctx, |ui| {
-                        ui.label("Create a new file under the current project.");
-                        ui.add_space(8.0);
-                        ui.label("File name");
-                        ui.text_edit_singleline(name);
-                        ui.add_space(8.0);
+                        modal_title(ui, "New file");
+                        ui.add_space(6.0);
+                        modal_body(ui, "Create a new file under the current project.");
+                        ui.add_space(10.0);
+                        modal_caption(ui, "File name");
+                        ui.add_space(4.0);
+                        modal_single_line_edit(ui, name);
+                        ui.add_space(10.0);
 
-                        ComboBox::from_id_salt("new_file_extension")
-                            .selected_text(extension.label())
+                        modal_caption(ui, "Extension");
+                        ui.add_space(4.0);
+                        ComboBox::from_id_salt("new_file_extension_modal")
+                            .selected_text(
+                                RichText::new(extension.label())
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::ACCENT_DIM),
+                            )
                             .show_ui(ui, |ui| {
                                 for candidate in [
-                                    FileExtension::Lain,
+                                    FileExtension::Fm,
+                                    FileExtension::Asm,
+                                    FileExtension::Gas,
                                     FileExtension::H,
                                     FileExtension::Md,
                                     FileExtension::Txt,
                                 ] {
-                                    ui.selectable_value(extension, candidate, candidate.label());
+                                    let label = RichText::new(candidate.label())
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(theme::ACCENT_DIM);
+                                    ui.selectable_value(extension, candidate, label);
                                 }
                             });
 
                         if let Some(message) = err.as_ref() {
                             ui.add_space(8.0);
-                            ui.colored_label(Color32::from_rgb(255, 140, 140), message);
+                            modal_error(ui, message);
                         }
 
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
+                            if modal_btn_secondary(ui, "Cancel").clicked() {
                                 action = ModalAction::Close;
-                            }
-                            if ui.button("Create").clicked() {
+                            } else if modal_btn_primary(ui, "Create").clicked() {
                                 action = ModalAction::CreateFile(name.clone(), *extension);
                             }
                         });
                     });
             }
             ModalState::ConfirmOpenFolder { err } => {
-                Window::new("Unsaved changes")
+                Window::new("Unsaved changes — open folder")
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .collapsible(false)
                     .resizable(false)
-                    .frame(
-                        Frame::NONE
-                            .fill(Color32::from_rgb(3, 8, 3))
-                            .stroke(Stroke::new(1.5, START_GREEN_DIM))
-                            .corner_radius(CornerRadius::ZERO)
-                            .inner_margin(Margin::same(14)),
-                    )
+                    .frame(modal_window_frame())
                     .show(ctx, |ui| {
-                        ui.label("Save the current file before opening another folder?");
+                        modal_title(ui, "Unsaved changes");
+                        ui.add_space(6.0);
+                        modal_body(
+                            ui,
+                            "Save the current file before opening another folder?",
+                        );
                         if let Some(message) = err.as_ref() {
                             ui.add_space(8.0);
-                            ui.colored_label(Color32::from_rgb(255, 140, 140), message);
+                            modal_error(ui, message);
                         }
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Save").clicked() {
+                            if modal_btn_primary(ui, "Save").clicked() {
                                 action = ModalAction::SaveThenOpenFolder;
-                            }
-                            if ui.button("Don't Save").clicked() {
+                            } else if modal_btn_danger(ui, "Don't Save").clicked() {
                                 action = ModalAction::DiscardThenOpenFolder;
+                            } else if modal_btn_secondary(ui, "Cancel").clicked() {
+                                action = ModalAction::Close;
                             }
-                            if ui.button("Cancel").clicked() {
+                        });
+                    });
+            }
+            ModalState::ConfirmQuit { err } => {
+                Window::new("Unsaved changes — quit")
+                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                    .collapsible(false)
+                    .resizable(false)
+                    .frame(modal_window_frame())
+                    .show(ctx, |ui| {
+                        modal_title(ui, "Unsaved changes");
+                        ui.add_space(6.0);
+                        modal_body(ui, "Save unsaved changes before closing?");
+                        if let Some(message) = err.as_ref() {
+                            ui.add_space(8.0);
+                            modal_error(ui, message);
+                        }
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if modal_btn_primary(ui, "Save").clicked() {
+                                action = ModalAction::SaveThenQuit;
+                            } else if modal_btn_danger(ui, "Don't Save").clicked() {
+                                action = ModalAction::DiscardThenQuit;
+                            } else if modal_btn_secondary(ui, "Cancel").clicked() {
                                 action = ModalAction::Close;
                             }
                         });
                     });
             }
             ModalState::InstallAvrdudeHomebrew => {
-                Window::new("Install AVRDUDE Homebrew")
+                Window::new("Install AVRDUDE (Homebrew)")
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .collapsible(false)
                     .resizable(false)
-                    .frame(
-                        Frame::NONE
-                            .fill(Color32::from_rgb(3, 8, 3))
-                            .stroke(Stroke::new(1.5, START_GREEN_DIM))
-                            .corner_radius(CornerRadius::ZERO)
-                            .inner_margin(Margin::same(14)),
-                    )
+                    .frame(modal_window_frame())
                     .show(ctx, |ui| {
-                        ui.label(
+                        modal_title(ui, "Install AVRDUDE");
+                        ui.add_space(6.0);
+                        modal_body(
+                            ui,
                             "avrdude was not found. This runs brew install avrdude. \
                              If Homebrew is not installed, the official installer runs next (silent, NONINTERACTIVE; may take several minutes).",
                         );
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
+                            if modal_btn_secondary(ui, "Cancel").clicked() {
                                 action = ModalAction::Close;
-                            }
-                            if ui.button("Install").clicked() {
+                            } else if modal_btn_primary(ui, "Install").clicked() {
                                 action = ModalAction::RunAvrdudeHomebrewInstall;
                             }
                         });
@@ -1089,8 +1132,26 @@ impl LainApp {
                 }
             },
             ModalAction::DiscardThenOpenFolder => {
+                self.editor.discard_unsaved_changes();
                 self.modal = ModalState::None;
                 self.perform_open_folder_picker();
+            }
+            ModalAction::SaveThenQuit => match self.save_current_file() {
+                Ok(msg) => {
+                    self.set_status(msg);
+                    self.modal = ModalState::None;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                Err(message) => {
+                    if let ModalState::ConfirmQuit { err } = &mut self.modal {
+                        *err = Some(message);
+                    }
+                }
+            },
+            ModalAction::DiscardThenQuit => {
+                self.editor.discard_unsaved_changes();
+                self.modal = ModalState::None;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             ModalAction::RunAvrdudeHomebrewInstall => {
                 self.modal = ModalState::None;
@@ -1107,34 +1168,51 @@ impl LainApp {
     }
 }
 
-impl eframe::App for LainApp {
+impl eframe::App for FullMetalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.boot_video.done() {
-            egui::CentralPanel::default()
-                .frame(
-                    Frame::NONE
-                        .fill(Color32::BLACK)
-                        .inner_margin(Margin::ZERO),
-                )
-                .show(ctx, |ui| {
-                    ui.set_min_size(ui.available_size());
-                    self.boot_video.show(ctx, ui);
-                });
-            return;
-        }
-
         self.poll_upload_job();
         if self.upload_job_rx.is_some() {
             ctx.request_repaint();
         }
 
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let block_close =
+                self.editor.is_dirty() || matches!(self.modal, ModalState::ConfirmQuit { .. });
+            if block_close {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                if self.editor.is_dirty() && !matches!(self.modal, ModalState::ConfirmQuit { .. }) {
+                    self.modal = ModalState::ConfirmQuit { err: None };
+                }
+            }
+        }
+
+        let editor_id = self.editor.text_edit_id();
+        if ctx.memory(|m| m.has_focus(editor_id)) {
+            self.editor.apply_editor_zoom_keyboard(ctx);
+        }
+        if ctx.memory(|m| m.has_focus(editor_id)) && self.editor.board_inline_accept_ok() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
+                || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+            {
+                self.editor.apply_board_inline_completion(ctx);
+            }
+        }
+
+        self.sim.clear_peripheral_inputs();
+        apply_peripherals_to_cpu(&self.peripheral_state, &mut self.sim);
+        if !self.show_peripherals {
+            let root_buf = Some(self.workspace.root.clone());
+            on_peripherals_panel_hidden(&mut self.peripheral_state, ctx, root_buf.as_deref());
+        }
+        if !self.show_waveforms {
+            on_waveforms_panel_hidden(&mut self.waveform_state, ctx);
+        }
+
         let mut toolbar_action = ToolbarAction::None;
 
-        if let AppPhase::Editor { workspace } = &self.phase {
-            if workspace.model == McuModel::Atmega328P {
-                self.ed060sc4_sim = false;
-            }
-            let ed060_was = self.ed060sc4_sim;
+        {
+            let workspace = &self.workspace;
             TopBottomPanel::top("retro_toolbar")
                 .exact_height(44.0)
                 .show(ctx, |ui| {
@@ -1144,58 +1222,57 @@ impl eframe::App for LainApp {
                         &workspace.root,
                         self.editor.is_dirty(),
                         self.show_sim,
+                        self.show_peripherals,
+                        self.show_waveforms,
                         self.show_upload,
                         self.show_word_helper || self.show_cycle_helper,
-                        workspace.model,
-                        &mut self.ed060sc4_sim,
+                        self.assembled_board,
                     );
                 });
-            if self.ed060sc4_sim && !ed060_was {
-                self.sim.configure_xmem(XMEM_MAX);
-                self.xmem_state.size_text = XMEM_MAX.to_string();
-            }
 
             let files = list_workspace_supported_files(&workspace.root);
             let active = workspace.active_file.clone();
             let mut pending_switch: Option<PathBuf> = None;
-            TopBottomPanel::top("workspace_files_bar")
-                .exact_height(32.0)
-                .show(ctx, |ui| {
-                    Frame::NONE
-                        .fill(Color32::from_rgb(4, 8, 4))
-                        .stroke(Stroke::new(1.0, START_GREEN_DIM))
-                        .inner_margin(Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            egui::ScrollArea::horizontal()
-                                .id_salt("workspace_files_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        for path in &files {
-                                            let is_active = active.as_ref() == Some(path);
-                                            let rel = path
-                                                .strip_prefix(&workspace.root)
-                                                .ok()
-                                                .unwrap_or(path.as_path());
-                                            let name = rel.display().to_string();
-                                            let resp = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(name)
-                                                        .monospace()
-                                                        .size(12.0)
-                                                        .color(if is_active { Color32::BLACK } else { START_GREEN }),
-                                                )
-                                                .fill(if is_active { START_GREEN } else { Color32::TRANSPARENT })
-                                                .stroke(Stroke::new(1.0, START_GREEN_DIM)),
-                                            );
-                                            if resp.clicked() {
-                                                pending_switch = Some(path.clone());
+            if files.len() > 1 {
+                TopBottomPanel::top("workspace_files_bar")
+                    .exact_height(32.0)
+                    .show(ctx, |ui| {
+                        Frame::NONE
+                            .fill(theme::PANEL_LIFT)
+                            .stroke(Stroke::new(1.0, START_GREEN_DIM))
+                            .inner_margin(Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("workspace_files_scroll")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for path in &files {
+                                                let is_active = active.as_ref() == Some(path);
+                                                let rel = path
+                                                    .strip_prefix(&workspace.root)
+                                                    .ok()
+                                                    .unwrap_or(path.as_path());
+                                                let name = rel.display().to_string();
+                                                let resp = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new(name)
+                                                            .monospace()
+                                                            .size(12.0)
+                                                            .color(if is_active { Color32::BLACK } else { START_GREEN }),
+                                                    )
+                                                    .fill(if is_active { START_GREEN } else { Color32::TRANSPARENT })
+                                                    .stroke(Stroke::new(1.0, START_GREEN_DIM)),
+                                                );
+                                                if resp.clicked() {
+                                                    pending_switch = Some(path.clone());
+                                                }
                                             }
-                                        }
+                                        });
                                     });
-                                });
-                        });
-                });
+                            });
+                    });
+            }
 
             if let Some(path) = pending_switch {
                 match self.switch_active_file(path) {
@@ -1208,30 +1285,28 @@ impl eframe::App for LainApp {
         // rhs_panel_editor_only: sim, helpers, or upload (mutually exclusive)
         let mut sim_action = SimAction::None;
         let mut upload_action = UploadAction::None;
-        let rhs_open = (self.show_sim
+        let mut wf_action = WaveformAction::None;
+        let rhs_open = self.show_sim
+            || self.show_peripherals
+            || self.show_waveforms
             || self.show_word_helper
             || self.show_cycle_helper
-            || self.show_upload)
-            && matches!(self.phase, AppPhase::Editor { .. });
+            || self.show_upload;
 
         if rhs_open {
             egui::SidePanel::right("rhs_panel")
-                .exact_width(340.0)
+                .exact_width(360.0)
                 .resizable(false)
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
+                    let model = self.mcu_model_from_editor();
                     if self.show_upload {
-                        let model = self
-                            .current_workspace()
-                            .map(|w| w.model)
-                            .unwrap_or(McuModel::Atmega328P);
                         let ports = scan_serial_ports();
                         upload_action = show_upload_panel(
                             ui,
                             FIRMWARE_HEX,
-                            self.current_workspace().is_some(),
-                            model.avrdude_part(),
-                            model.label(),
+                            true,
+                            self.assembled_board,
                             &mut self.upload_programmer,
                             &mut self.upload_port,
                             &mut self.upload_port_custom,
@@ -1239,9 +1314,7 @@ impl eframe::App for LainApp {
                             &self.upload_status_line,
                         );
                     } else if self.show_sim {
-                        if !self.ed060sc4_sim && self.sim_tab == SimTab::Eink {
-                            self.sim_tab = SimTab::Cpu;
-                        }
+                        let peripheral_pins = self.peripheral_state.pin_occupancy();
                         sim_action = show_sim_panel(
                             ui,
                             &self.sim,
@@ -1254,14 +1327,33 @@ impl eframe::App for LainApp {
                             &mut self.breakpoints,
                             &mut self.stack_state,
                             &mut self.xmem_state,
-                            self.ed060sc4_sim,
-                            &mut self.ed060_display.open,
+                            &peripheral_pins,
+                            self.assembled_board,
+                        );
+                    } else if self.show_peripherals {
+                        let project_root_buf = self.workspace.root.clone();
+                        show_peripherals_panel(
+                            ui,
+                            &mut self.peripheral_state,
+                            model,
+                            &self.sim,
+                            Some(project_root_buf.as_path()),
+                        );
+                    } else if self.show_waveforms {
+                        wf_action = show_waveforms_panel(
+                            ctx,
+                            ui,
+                            &mut self.waveform_state,
+                            &self.sim,
+                            model,
+                            &mut self.speed_limit,
+                            &mut self.auto_running,
                         );
                     } else if self.show_word_helper {
-                        let files = self.collect_lain_files();
+                        let files = self.collect_asm_files();
                         show_word_helper(ui, &mut self.word_helper_state, &files);
                     } else if self.show_cycle_helper {
-                        let files = self.collect_lain_files();
+                        let files = self.collect_asm_files();
                         show_cycle_helper(ui, &mut self.cycle_helper_state, &files);
                     }
                 });
@@ -1276,81 +1368,26 @@ impl eframe::App for LainApp {
             .show(ctx, |ui| {
                 ui.set_min_size(ui.available_size());
 
-                match &mut self.phase {
-                    AppPhase::Welcome => match show_welcome(ui, &mut self.skip_start_animation) {
-                        WelcomeAction::OpenFolder => {
-                            self.perform_open_folder_picker();
-                        }
-                        WelcomeAction::CreateNew => {
-                            self.phase = AppPhase::CreateProject {
-                                parent_dir: None,
-                                name: String::new(),
-                                model: McuModel::Atmega328P,
-                                err: None,
-                            };
-                        }
-                        WelcomeAction::None => {}
-                    },
-                    AppPhase::CreateProject {
-                        parent_dir,
-                        name,
-                        model,
-                        err,
-                    } => match show_create_project(ui, parent_dir, name, model, err) {
-                        CreateProjectAction::PickParentFolder => {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_title("Choose parent folder")
-                                .pick_folder()
-                            {
-                                *parent_dir = Some(path);
-                                *err = None;
-                            }
-                        }
-                        CreateProjectAction::Back => {
-                            self.phase = AppPhase::Welcome;
-                        }
-                        CreateProjectAction::Submit => {
-                            *err = None;
-                            if let Some(parent) = parent_dir.clone() {
-                                match try_create_lain_project(&parent, name, *model) {
-                                    Ok((root, lain_path, model)) => {
-                                        self.enter_editor(Workspace {
-                                            root,
-                                            active_file: Some(lain_path),
-                                            model,
-                                        });
-                                        self.set_status("Created project.");
-                                    }
-                                    Err(message) => *err = Some(message),
-                                }
-                            } else {
-                                *err = Some("Choose a parent folder first.".to_string());
-                            }
-                        }
-                        CreateProjectAction::None => {}
-                    },
-                    AppPhase::Editor { .. } => {
-                        if matches!(self.modal, ModalState::None) {
-                            self.editor.request_initial_focus(ctx);
-                        }
-                        ui.vertical(|ui| {
-                            if let Some(status) = &self.status {
-                                ui.label(
-                                    RichText::new(&status.text)
-                                        .monospace()
-                                        .size(13.0)
-                                        .color(if status.is_error {
-                                            Color32::from_rgb(255, 140, 140)
-                                        } else {
-                                            START_GREEN_DIM
-                                        }),
-                                );
-                                ui.add_space(6.0);
-                            }
-                            self.editor.show(ui);
-                        });
-                    }
+                if matches!(self.modal, ModalState::None) {
+                    self.editor.request_initial_focus(ctx);
                 }
+                let ghost = self.workspace.active_file.is_none() && self.editor.source().is_empty();
+                ui.vertical(|ui| {
+                    if let Some(status) = &self.status {
+                        ui.label(
+                            RichText::new(&status.text)
+                                .monospace()
+                                .size(13.0)
+                                .color(if status.is_error {
+                                    Color32::from_rgb(255, 140, 140)
+                                } else {
+                                    START_GREEN_DIM
+                                }),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    self.editor.show(ui, ghost);
+                });
             });
 
         if toolbar_action != ToolbarAction::None {
@@ -1366,10 +1403,25 @@ impl eframe::App for LainApp {
             UploadAction::UploadAvrdude => self.rebuild_firmware_hex_then_upload(),
         }
 
+        match wf_action {
+            WaveformAction::None => {}
+            WaveformAction::StartAuto => {
+                if !self.auto_running {
+                    self.auto_running = true;
+                    self.ips_sample_start = std::time::Instant::now();
+                    self.ips_sample_steps = 0;
+                    self.limit_clock = std::time::Instant::now();
+                    self.limit_steps_done = 0;
+                }
+            }
+            WaveformAction::PauseAuto => {
+                self.auto_running = false;
+            }
+        }
+
         match sim_action {
             SimAction::None => {}
             SimAction::Assemble => {
-                let model = self.current_workspace().map(|w| w.model).unwrap_or(McuModel::Atmega128A);
                 let source = match self.source_for_assembly() {
                     Ok(src) => src,
                     Err(err) => {
@@ -1377,13 +1429,22 @@ impl eframe::App for LainApp {
                         return;
                     }
                 };
-                match assemble_for_model(&source, model) {
+                match assemble_for_model(&source) {
                     Ok(words) => {
                         let n = words.len();
-                        self.sim.reset();
+                        let model = parse_board_from_source(&source)
+                            .expect("assemble succeeded implies valid .board");
+                        // Must match `McuModel` from `.board` — SRAM bounds, IVT layout, and flash
+                        // limit all depend on the chip (328P vs 128A are not interchangeable).
+                        if self.sim.model != model {
+                            self.reset_simulator_for_workspace(model);
+                        } else {
+                            self.sim.reset();
+                        }
                         self.sim.load_flash(&words);
                         self.sim_last_result = None;
-                        self.ed060_display.on_cpu_reset(&self.sim);
+                        self.waveform_state.on_reset();
+                        self.assembled_board = Some(model);
                         self.set_status(format!(
                             "Assembled {n} word{} → Flash.",
                             if n == 1 { "" } else { "s" }
@@ -1401,33 +1462,31 @@ impl eframe::App for LainApp {
             }
             SimAction::Step => {
                 self.sim_last_result = Some(self.sim.step());
-                self.drive_ed060_from_cpu();
+                self.waveform_state.sample_cpu(&self.sim);
             }
             SimAction::Run10 => {
-                let on = self.ed060_port_driven();
                 let (_, r) = {
+                    let wf = &mut self.waveform_state;
                     let sim = &mut self.sim;
-                    let disp = &mut self.ed060_display;
                     sim.step_n_hook(10, |cpu| {
-                        disp.drive_from_cpu(cpu, on);
+                        wf.sample_cpu(cpu);
                     })
                 };
                 self.sim_last_result = Some(r);
             }
             SimAction::Run100 => {
-                let on = self.ed060_port_driven();
                 let (_, r) = {
+                    let wf = &mut self.waveform_state;
                     let sim = &mut self.sim;
-                    let disp = &mut self.ed060_display;
                     sim.step_n_hook(100, |cpu| {
-                        disp.drive_from_cpu(cpu, on);
+                        wf.sample_cpu(cpu);
                     })
                 };
                 self.sim_last_result = Some(r);
             }
             SimAction::Reset => {
                 self.sim.reset();
-                self.ed060_display.on_cpu_reset(&self.sim);
+                self.waveform_state.on_reset();
                 self.sim_last_result = None;
                 self.auto_running = false;
                 self.ips = 0.0;
@@ -1447,7 +1506,6 @@ impl eframe::App for LainApp {
             }
             SimAction::SetIoBit { addr, mask } => {
                 self.sim.set_io_bit(addr, mask);
-                self.drive_ed060_from_cpu();
             }
             SimAction::SetXmem(size) => {
                 self.sim.configure_xmem(size);
@@ -1458,6 +1516,12 @@ impl eframe::App for LainApp {
         if self.auto_running {
             let bp_addrs  = self.breakpoints.active_addrs();
             let limit_ips = self.speed_limit.limit_ips();
+            let cur_limit_bits = limit_ips.map(f64::to_bits);
+            if cur_limit_bits != self.last_limit_ips_bits {
+                self.limit_clock = std::time::Instant::now();
+                self.limit_steps_done = 0;
+            }
+            self.last_limit_ips_bits = cur_limit_bits;
 
             let (steps, result, bp_hit) = if let Some(limit) = limit_ips {
                 // token-bucket: compare wall-clock elapsed against steps already done
@@ -1470,12 +1534,11 @@ impl eframe::App for LainApp {
                     // cap each burst to ~20 ms worth to keep the UI responsive
                     let burst_cap = ((limit * 0.020) as u64).max(1);
                     let batch = to_run.min(burst_cap);
-                    let on = self.ed060_port_driven();
                     let r = {
+                        let wf = &mut self.waveform_state;
                         let sim = &mut self.sim;
-                        let disp = &mut self.ed060_display;
                         sim.run_n_break_hook(batch, &bp_addrs, |cpu| {
-                            disp.drive_from_cpu(cpu, on);
+                            wf.sample_cpu(cpu);
                         })
                     };
                     self.limit_steps_done += r.0;
@@ -1487,11 +1550,10 @@ impl eframe::App for LainApp {
                 }
             } else {
                 // unlimited: run for 12 ms
-                let on = self.ed060_port_driven();
+                let wf = &mut self.waveform_state;
                 let sim = &mut self.sim;
-                let disp = &mut self.ed060_display;
                 sim.run_timed_break_hook(12, &bp_addrs, |cpu| {
-                    disp.drive_from_cpu(cpu, on);
+                    wf.sample_cpu(cpu);
                 })
             };
 
@@ -1528,26 +1590,12 @@ impl eframe::App for LainApp {
             ctx.request_repaint(); // auto_run_repaint
         }
 
-        // doc_overlays_z_last
-        let ed060_display_ok = matches!(
-            &self.phase,
-            AppPhase::Editor { workspace }
-                if workspace.model == McuModel::Atmega128A && self.ed060sc4_sim
-        );
-        self.ed060_display.close_if_unavailable(ed060_display_ok);
-        if ed060_display_ok {
-            self.ed060_display.show_window(ctx);
-        }
-
-        show_isa_window(ctx, &mut self.show_isa);
-        show_flash_locations_window(ctx, &mut self.show_flash_locations, &self.sim);
+        show_flash_locations_window(ctx, &mut self.show_flash_locations, self.assembled_board, &self.sim);
 
         self.show_modal(ctx);
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "skip_start_animation", &self.skip_start_animation);
-    }
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
 }
 
 fn validate_leaf_name(name: &str) -> Result<String, String> {
@@ -1572,10 +1620,18 @@ fn validate_leaf_name(name: &str) -> Result<String, String> {
 }
 
 fn is_supported_text_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("lain" | "h" | "md" | "txt")
-    )
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "fm" | "h" | "md" | "txt" | "asm" | "s"
+            )
+        })
+}
+
+fn scratch_workspace_root() -> PathBuf {
+    std::env::temp_dir().join("full_metal_studio_scratch")
 }
 
 fn read_text_file(path: &Path) -> Result<String, String> {
@@ -1584,43 +1640,6 @@ fn read_text_file(path: &Path) -> Result<String, String> {
 
 fn find_first_supported_file(root: &Path) -> Option<PathBuf> {
     list_workspace_supported_files(root).into_iter().next()
-}
-
-/// mkdir_project parent_name_lainfile
-fn try_create_lain_project(parent: &Path, name: &str, model: McuModel) -> Result<(PathBuf, PathBuf, McuModel), String> {
-    let name = validate_leaf_name(name)?;
-    let root = parent.join(&name);
-    if root.exists() {
-        return Err(format!("Already exists: {}", root.display()));
-    }
-    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let lain_path = root.join(format!("{name}.lain"));
-    let initial_src = match model {
-        McuModel::Atmega328P => NEW_PROJECT_LAIN_ATMEGA328P,
-        McuModel::Atmega128A => "",
-    };
-    fs::write(&lain_path, initial_src).map_err(|e| e.to_string())?;
-    let marker = match model {
-        McuModel::Atmega128A => root.join(".128"),
-        McuModel::Atmega328P => root.join(".328"),
-    };
-    fs::write(marker, "").map_err(|e| e.to_string())?;
-    Ok((root, lain_path, model))
-}
-
-fn ensure_workspace_model_marker(root: &Path) -> Result<McuModel, String> {
-    let marker_128 = root.join(".128");
-    let marker_328 = root.join(".328");
-
-    if marker_128.exists() {
-        return Ok(McuModel::Atmega128A);
-    }
-    if marker_328.exists() {
-        return Ok(McuModel::Atmega328P);
-    }
-
-    fs::write(&marker_328, "").map_err(|e| e.to_string())?;
-    Ok(McuModel::Atmega328P)
 }
 
 fn list_workspace_supported_files(root: &Path) -> Vec<PathBuf> {

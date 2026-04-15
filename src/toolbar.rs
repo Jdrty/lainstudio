@@ -4,12 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eframe::egui::{
-    menu, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText,
+    menu, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Stroke, Ui,
 };
 
 use crate::avr::McuModel;
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::theme::{self, START_GREEN, START_GREEN_DIM};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolbarAction {
@@ -21,15 +21,16 @@ pub enum ToolbarAction {
     OpenFolder,
     AddFileToProject,
     SimTogglePanel,
+    PeripheralsTogglePanel,
+    WaveformsTogglePanel,
     UploadTogglePanel,
-    DocsInstructionSet,
     DocsFlashLocations,
     HelpersWordHelper,
     HelpersCycleHelper,
 }
 
 fn title_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(Arc::from("lain_title")))
+    FontId::new(size, FontFamily::Name(Arc::from("fm_title")))
 }
 
 fn apply_dropdown_style(ui: &mut Ui) {
@@ -55,16 +56,17 @@ pub fn show_toolbar(
     active_file:         Option<&Path>,
     workspace_root:      &Path,
     is_dirty:            bool,
-    sim_visible:     bool,
-    upload_visible:  bool,
-    helpers_visible: bool,
-    workspace_model:   McuModel,
-    ed060sc4_sim:      &mut bool,
+    sim_visible:        bool,
+    peripherals_visible: bool,
+    waveforms_visible:   bool,
+    upload_visible:     bool,
+    helpers_visible:    bool,
+    assembled_board:   Option<McuModel>,
 ) -> ToolbarAction {
     let mut action = ToolbarAction::None;
 
     Frame::NONE
-        .fill(Color32::from_rgb(5, 10, 5))
+        .fill(theme::PANEL_MID)
         .stroke(Stroke::new(1.0, START_GREEN_DIM))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
@@ -121,6 +123,32 @@ pub fn show_toolbar(
                     action = ToolbarAction::SimTogglePanel;
                 }
 
+                let periph_label = if peripherals_visible { "PERIPH ▪" } else { "PERIPH" };
+                if ui
+                    .add(eframe::egui::Button::new(
+                        RichText::new(periph_label)
+                            .font(title_font(18.0))
+                            .color(START_GREEN),
+                    )
+                    .frame(false))
+                    .clicked()
+                {
+                    action = ToolbarAction::PeripheralsTogglePanel;
+                }
+
+                let wf_label = if waveforms_visible { "WAVEFORMS ▪" } else { "WAVEFORMS" };
+                if ui
+                    .add(eframe::egui::Button::new(
+                        RichText::new(wf_label)
+                            .font(title_font(18.0))
+                            .color(START_GREEN),
+                    )
+                    .frame(false))
+                    .clicked()
+                {
+                    action = ToolbarAction::WaveformsTogglePanel;
+                }
+
                 let upload_label = if upload_visible { "UPLOAD ▪" } else { "UPLOAD" };
                 if ui
                     .add(eframe::egui::Button::new(
@@ -135,42 +163,11 @@ pub fn show_toolbar(
                 }
 
                 ui.menu_button(
-                    RichText::new("MISC")
-                        .font(title_font(18.0))
-                        .color(START_GREEN),
-                    |ui| {
-                        apply_dropdown_style(ui);
-                        let ed060_128a = workspace_model == McuModel::Atmega128A;
-                        ui.add_enabled_ui(ed060_128a, |ui| {
-                            let _ = ui.checkbox(
-                                ed060sc4_sim,
-                                RichText::new("ED060SC4 Simulator")
-                                    .monospace()
-                                    .size(13.0)
-                                    .color(START_GREEN),
-                            );
-                        });
-                        if !ed060_128a {
-                            ui.label(
-                                RichText::new("ATmega128A only")
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(Color32::from_gray(100)),
-                            );
-                        }
-                    },
-                );
-
-                ui.menu_button(
                     RichText::new("DOCS")
                         .font(title_font(18.0))
                         .color(START_GREEN),
                     |ui| {
                         apply_dropdown_style(ui);
-                        if ui.button("Instruction set").clicked() {
-                            action = ToolbarAction::DocsInstructionSet;
-                            ui.close_menu();
-                        }
                         if ui.button("Flash locations").clicked() {
                             action = ToolbarAction::DocsFlashLocations;
                             ui.close_menu();
@@ -200,7 +197,7 @@ pub fn show_toolbar(
                     let mut label = active_file
                         .and_then(|path| path.file_name())
                         .map(|name| name.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "(no file selected)".to_string());
+                        .unwrap_or_else(|| "(unsaved)".to_string());
                     if is_dirty {
                         label.push_str(" *");
                     }
@@ -212,6 +209,17 @@ pub fn show_toolbar(
                             .size(14.0),
                     );
                     ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(
+                            assembled_board
+                                .map(|m| m.label().to_string())
+                                .unwrap_or_else(|| "—".to_string()),
+                        )
+                            .monospace()
+                            .color(START_GREEN_DIM)
+                            .size(11.5),
+                    );
+                    ui.add_space(10.0);
                     ui.label(
                         RichText::new(workspace_root.display().to_string())
                             .monospace()

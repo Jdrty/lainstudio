@@ -4,11 +4,12 @@ use eframe::egui::{
     self, Button, Color32, ComboBox, Frame, Margin, RichText, Stroke, TextEdit, Ui,
 };
 use crate::avr::assembler::assemble_full;
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::theme;
+use crate::theme::{START_GREEN, START_GREEN_DIM};
 
-const AMBER:   Color32 = Color32::from_rgb(255, 185, 55);
-const DIM:     Color32 = Color32::from_rgb(65,  65,  65);
-const ERR_RED: Color32 = Color32::from_rgb(255, 80,  80);
+const FOCUS: Color32 = theme::FOCUS;
+const DIM: Color32 = theme::DIM_GRAY;
+const ERR_RED: Color32 = theme::ERR_RED;
 
 // RJMP is ±2047 from (PC+1), 1 word.  JMP is 2 words but unlimited range.
 const RJMP_MAX: i64 = 2047;
@@ -62,7 +63,7 @@ pub fn show_word_helper(
     files: &[(String, String)],
 ) {
     Frame::NONE
-        .fill(Color32::from_rgb(3, 7, 3))
+        .fill(theme::PANEL_DEEP)
         .stroke(Stroke::new(1.0, START_GREEN_DIM))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
@@ -78,7 +79,7 @@ pub fn show_word_helper(
 
             if files.is_empty() {
                 ui.label(
-                    RichText::new("No .lain files found in workspace.")
+                    RichText::new("No valid files found in workspace.")
                         .monospace().size(11.5).color(DIM),
                 );
                 return;
@@ -159,7 +160,7 @@ fn render_slot(
                 Ok(addr) => {
                     ui.label(
                         RichText::new(format!("  → word address 0x{addr:04X}"))
-                            .monospace().size(11.0).color(AMBER),
+                            .monospace().size(11.0).color(FOCUS),
                     );
                     Ok(addr)
                 }
@@ -208,12 +209,12 @@ fn show_results(ui: &mut Ui, a: u32, b: u32) {
         } else {
             ui.add(
                 Button::new(RichText::new("JMP").monospace().size(12.0).color(Color32::BLACK))
-                    .fill(AMBER)
-                    .stroke(Stroke::new(1.0, AMBER)),
+                    .fill(FOCUS)
+                    .stroke(Stroke::new(1.0, FOCUS)),
             );
             ui.label(
                 RichText::new(format!("  2 words  (offset {off_ab:+}, exceeds ±2047)"))
-                    .monospace().size(11.0).color(AMBER),
+                    .monospace().size(11.0).color(FOCUS),
             );
         }
     });
@@ -238,12 +239,12 @@ fn show_results(ui: &mut Ui, a: u32, b: u32) {
         } else {
             ui.add(
                 Button::new(RichText::new("JMP").monospace().size(12.0).color(Color32::BLACK))
-                    .fill(AMBER)
-                    .stroke(Stroke::new(1.0, AMBER)),
+                    .fill(FOCUS)
+                    .stroke(Stroke::new(1.0, FOCUS)),
             );
             ui.label(
                 RichText::new(format!("  2 words  (offset {off_ba:+}, exceeds ±2047)"))
-                    .monospace().size(11.0).color(AMBER),
+                    .monospace().size(11.0).color(FOCUS),
             );
         }
     });

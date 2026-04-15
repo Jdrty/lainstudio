@@ -1,20 +1,18 @@
 //! avr_asm highlighter layoutjob full_span egui_cursor_safe
-//! colours: mnemonic_green reg_white imm_amber label_cyan comment_dim punct_grey
+//! colours: mnemonic accent, reg white, imm literal, label cyan, comment dim
 
 use eframe::egui::{
     text::{LayoutJob, TextFormat},
     Color32, FontId,
 };
 
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::theme;
 
-// palette
-
-const MNEMONIC: Color32 = START_GREEN;
-const COMMENT: Color32 = START_GREEN_DIM;
+const MNEMONIC: Color32 = theme::ACCENT;
+const COMMENT: Color32 = theme::ACCENT_DIM;
 const REGISTER: Color32 = Color32::WHITE;
-const NUMBER:   Color32 = Color32::from_rgb(255, 185, 55);  // AMBER
-const LABEL:    Color32 = Color32::from_rgb(120, 210, 255); // CYAN
+const NUMBER: Color32 = theme::LITERAL_NUM;
+const LABEL: Color32 = theme::LABEL_CYAN;
 const PUNCT:    Color32 = Color32::from_rgb(90, 90, 90);
 const WS:       Color32 = Color32::from_rgb(55, 55, 55);
 

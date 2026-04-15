@@ -4,6 +4,7 @@ pub mod assembler;
 pub mod cpu;
 pub mod intel_hex;
 pub mod io_map;
+pub use assembler::parse_board_from_source;
 pub use cpu::Cpu;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

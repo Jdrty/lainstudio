@@ -5,11 +5,12 @@ use eframe::egui::{
 };
 use crate::avr::assembler::assemble_full;
 use crate::avr::cpu::Cpu;
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::theme;
+use crate::theme::{START_GREEN, START_GREEN_DIM};
 
-const AMBER:   Color32 = Color32::from_rgb(255, 185, 55);
-const DIM:     Color32 = Color32::from_rgb(65,  65,  65);
-const ERR_RED: Color32 = Color32::from_rgb(255, 80,  80);
+const FOCUS: Color32 = theme::FOCUS;
+const DIM: Color32 = theme::DIM_GRAY;
+const ERR_RED: Color32 = theme::ERR_RED;
 
 // state
 pub struct CycleHelperState {
@@ -74,7 +75,7 @@ pub fn show_cycle_helper(
     files: &[(String, String)],
 ) {
     Frame::NONE
-        .fill(Color32::from_rgb(3, 7, 3))
+        .fill(theme::PANEL_DEEP)
         .stroke(Stroke::new(1.0, START_GREEN_DIM))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
@@ -90,7 +91,7 @@ pub fn show_cycle_helper(
 
             if files.is_empty() {
                 ui.label(
-                    RichText::new("No .lain files found in workspace.")
+                    RichText::new("No valid files found in workspace.")
                         .monospace().size(11.5).color(DIM),
                 );
                 return;
@@ -155,7 +156,7 @@ pub fn show_cycle_helper(
                 resolve(&state.line_a_text)
             };
             match &addr_a_res {
-                Ok(a)  => { ui.label(RichText::new(format!("  → word 0x{a:04X}")).monospace().size(11.0).color(AMBER)); }
+                Ok(a)  => { ui.label(RichText::new(format!("  → word 0x{a:04X}")).monospace().size(11.0).color(FOCUS)); }
                 Err(e) if !e.is_empty() => { ui.label(RichText::new(format!("  ✗ {e}")).monospace().size(10.5).color(ERR_RED)); }
                 _ => { ui.label(RichText::new("").monospace().size(10.5)); }
             }
@@ -179,7 +180,7 @@ pub fn show_cycle_helper(
                 resolve(&state.line_b_text)
             };
             match &addr_b_res {
-                Ok(b)  => { ui.label(RichText::new(format!("  → word 0x{b:04X}")).monospace().size(11.0).color(AMBER)); }
+                Ok(b)  => { ui.label(RichText::new(format!("  → word 0x{b:04X}")).monospace().size(11.0).color(FOCUS)); }
                 Err(e) if !e.is_empty() => { ui.label(RichText::new(format!("  ✗ {e}")).monospace().size(10.5).color(ERR_RED)); }
                 _ => { ui.label(RichText::new("").monospace().size(10.5)); }
             }
@@ -246,8 +247,8 @@ fn show_cycle_results(ui: &mut Ui, flash: &[u16], a: u32, b: u32) {
                     RichText::new(format!("{mx} max"))
                         .monospace().size(13.0).color(Color32::BLACK),
                 )
-                .fill(AMBER)
-                .stroke(Stroke::new(1.0, AMBER)),
+                .fill(FOCUS)
+                .stroke(Stroke::new(1.0, FOCUS)),
             );
         });
         ui.add_space(2.0);

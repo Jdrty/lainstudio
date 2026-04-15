@@ -52,27 +52,85 @@ fn is_dot_byte_directive(instr: &str) -> bool {
         .eq_ignore_ascii_case(".byte")
 }
 
+pub fn parse_board_from_source(source: &str) -> Result<McuModel, Vec<AsmError>> {
+    let mut found: Option<McuModel> = None;
+    for (idx, raw) in source.lines().enumerate() {
+        let line_nr = idx + 1;
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (_, instr_part) = split_label_instr(line);
+        let mut it = instr_part.split_whitespace();
+        let Some(head) = it.next() else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(".board") {
+            continue;
+        }
+        let board_name = it.next();
+        if it.next().is_some() {
+            return Err(vec![AsmError {
+                line: line_nr,
+                msg: "too many operands for .board".to_string(),
+            }]);
+        }
+        let Some(name) = board_name else {
+            return Err(vec![AsmError {
+                line: line_nr,
+                msg: ".board requires ATmega128A or ATmega328P".to_string(),
+            }]);
+        };
+        let m = match name.to_ascii_uppercase().as_str() {
+            "ATMEGA128A" => McuModel::Atmega128A,
+            "ATMEGA328P" => McuModel::Atmega328P,
+            _ => {
+                return Err(vec![AsmError {
+                    line: line_nr,
+                    msg: format!("unknown board `{name}` (use ATmega128A or ATmega328P)"),
+                }]);
+            }
+        };
+        if found.is_some() {
+            return Err(vec![AsmError {
+                line: line_nr,
+                msg: "duplicate .board directive".to_string(),
+            }]);
+        }
+        found = Some(m);
+    }
+    found.ok_or_else(|| {
+        vec![AsmError {
+            line: 0,
+            msg: "missing .board directive (add `.board ATmega128A` or `.board ATmega328P` near the top)"
+                .to_string(),
+        }]
+    })
+}
+
+fn is_board_directive(instr_part: &str) -> bool {
+    instr_part
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case(".board"))
+}
+
 /// assemble source and also return a source-map of (1-indexed line → word address)
 /// only instruction lines appear in the map; labels, directives, and blanks are omitted
 pub fn assemble_full(
     source: &str,
 ) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
-    assemble_full_for_model(source, McuModel::Atmega128A)
-}
-
-pub fn assemble_full_for_model(
-    source: &str,
-    model: McuModel,
-) -> Result<(Vec<u16>, Vec<(usize, u32)>), Vec<AsmError>> {
+    let model = parse_board_from_source(source)?;
     assemble_inner(source, model, true)
 }
 
 #[allow(dead_code)]
 pub fn assemble(source: &str) -> Result<Vec<u16>, Vec<AsmError>> {
-    assemble_for_model(source, McuModel::Atmega128A)
+    assemble_for_model(source)
 }
 
-pub fn assemble_for_model(source: &str, model: McuModel) -> Result<Vec<u16>, Vec<AsmError>> {
+pub fn assemble_for_model(source: &str) -> Result<Vec<u16>, Vec<AsmError>> {
+    let model = parse_board_from_source(source)?;
     assemble_inner(source, model, false).map(|(w, _)| w)
 }
 
@@ -109,6 +167,12 @@ fn assemble_inner(
             continue;
         }
         let (maybe_label, instr_part) = split_label_instr(line);
+        if is_board_directive(instr_part) {
+            if let Some(lbl) = maybe_label {
+                labels.insert(lbl.to_lowercase(), addr);
+            }
+            continue;
+        }
         if let Some(seg) = parse_segment_directive(instr_part) {
             segment = seg;
             if let Some(lbl) = maybe_label {
@@ -159,6 +223,9 @@ fn assemble_inner(
             continue;
         }
         let (maybe_label, instr_part) = split_label_instr(line);
+        if is_board_directive(instr_part) {
+            continue;
+        }
         if let Some(seg) = parse_segment_directive(instr_part) {
             segment = seg;
             continue;
@@ -178,7 +245,7 @@ fn assemble_inner(
         if maybe_label.is_some() && instr_part.is_empty() { continue; }
         let instr_line = if maybe_label.is_some() { instr_part } else { line };
         if build_map { source_map.push((line_nr, addr)); }
-        match encode(instr_line, addr, &labels, &equates) {
+        match encode(instr_line, addr, &labels, &equates, model) {
             Ok(encoded) => { addr += encoded.len() as u32; words.extend(encoded); }
             Err(msg)    => errors.push(AsmError { line: line_nr, msg }),
         }
@@ -401,11 +468,19 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
         }
     }
 
-    // timer0_bits
-    add("CS00",  0); add("CS01",  1); add("CS02",  2);
-    add("WGM01", 3); add("COM00", 4); add("COM01", 5); add("WGM00", 6);
+    // timer0_bits — ATmega128A: single `TCCR0`; ATmega328P: split `TCCR0A` / `TCCR0B` (avr-libc names).
     if model == McuModel::Atmega128A {
+        add("CS00",  0); add("CS01",  1); add("CS02",  2);
+        add("WGM01", 3); add("COM00", 4); add("COM01", 5); add("WGM00", 6);
         add("FOC0", 7);
+    } else {
+        // TCCR0A
+        add("COM0A0", 6); add("COM0A1", 7);
+        add("COM0B0", 4); add("COM0B1", 5);
+        add("WGM00", 0); add("WGM01", 1);
+        add("COM00", 4); add("COM01", 5);
+        add("CS00", 0); add("CS01", 1); add("CS02", 2);
+        add("WGM02", 3);
     }
 
     // timer1_bits
@@ -527,7 +602,6 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
         add("OCIE0B", 2);
         add("OCF0A", 1);
         add("OCF0B", 2);
-        add("WGM02", 3);
         add("FOC0A", 7);
         add("FOC0B", 6);
         add("EEPE", 1);
@@ -760,12 +834,36 @@ fn instruction_words(line: &str) -> u32 {
     }
 }
 
+fn lds_sts_operand_addr(
+    operand: &str,
+    equates: &HashMap<String, u32>,
+    labels:  Option<&HashMap<String, u32>>,
+    model:   McuModel,
+) -> Result<u16, String> {
+    let s = strip_sfr_io_addr(operand.trim());
+    let v = sym(s, equates, labels)? as u16;
+    if model == McuModel::Atmega128A {
+        let upper = s.to_uppercase();
+        for &(name, io_off) in io_map::IO_NAMES {
+            if name.eq_ignore_ascii_case(&upper) {
+                let mem = io_map::io_to_mem(io_off);
+                if v == io_off as u16 || v == mem {
+                    return Ok(mem);
+                }
+                return Ok(v);
+            }
+        }
+    }
+    Ok(v)
+}
+
 // encoder
 fn encode(
     line:    &str,
     cur:     u32,
     labels:  &HashMap<String, u32>,
     equates: &HashMap<String, u32>,
+    model:   McuModel,
 ) -> Result<Vec<u16>, String> {
     let (mnem_raw, rest) = line.split_once(|c: char| c.is_whitespace()).unwrap_or((line, ""));
     let rest = rest.trim();
@@ -925,13 +1023,13 @@ fn encode(
     if m == "LDS" {
         let (ds, ks) = two_ops(rest)?;
         let d = reg(ds, equates)? as u16;
-        let k = sym(ks.trim(), equates, Some(labels))? as u16;
+        let k = lds_sts_operand_addr(ks.trim(), equates, Some(labels), model)?;
         return Ok(vec![0x9000 | ((d & 0x10) << 4) | ((d & 0x0F) << 4), k]);
     }
     if m == "STS" {
         let (ks, rs) = two_ops(rest)?;
         let r = reg(rs, equates)? as u16;
-        let k = sym(ks.trim(), equates, Some(labels))? as u16;
+        let k = lds_sts_operand_addr(ks.trim(), equates, Some(labels), model)?;
         return Ok(vec![0x9200 | ((r & 0x10) << 4) | ((r & 0x0F) << 4), k]);
     }
 
@@ -1482,20 +1580,33 @@ fn sym(
     Ok(v)
 }
 
+fn strip_sfr_io_addr(s: &str) -> &str {
+    let s = s.trim();
+    let upper = s.to_ascii_uppercase();
+    const P: &str = "_SFR_IO_ADDR(";
+    if upper.len() >= P.len() + 2 && upper.starts_with(P) && s.ends_with(')') {
+        if let Some(open) = s.find('(') {
+            return s[open + 1..s.len() - 1].trim();
+        }
+    }
+    s
+}
+
 /// io_addr_sym equ_io_names_num
 fn io_addr_sym(s: &str, equates: &HashMap<String, u32>) -> Result<u32, String> {
+    let s = strip_sfr_io_addr(s);
     // equ_first
-    let key = s.trim().to_lowercase();
+    let key = s.to_lowercase();
     if let Some(&v) = equates.get(&key) {
         return Ok(v);
     }
     // io_names
-    let upper = s.trim().to_uppercase();
+    let upper = s.to_uppercase();
     for &(name, addr) in io_map::IO_NAMES {
         if upper == name { return Ok(addr as u32); }
     }
     // bare_num
-    parse_imm(s.trim()).map_err(|_| format!("Unknown I/O register or bad address: '{s}'"))
+    parse_imm(s).map_err(|_| format!("Unknown I/O register or bad address: '{s}'"))
 }
 
 /// parse_imm hex_dollar_bin_dec no_sym_use_sym_instead
@@ -1552,22 +1663,47 @@ fn rr_op(base: u16, d: u16, r: u16) -> u16 {
 mod tests {
     use super::*;
 
+    fn b128(s: &str) -> String {
+        format!(".board ATmega128A\n{s}")
+    }
+
+    fn b328(s: &str) -> String {
+        format!(".board ATmega328P\n{s}")
+    }
+
     #[test]
-    fn asm_nop()  { assert_eq!(assemble("NOP").unwrap(), &[0x0000]); }
+    fn asm_nop()  { assert_eq!(assemble(&b128("NOP")).unwrap(), &[0x0000]); }
     #[test]
-    fn asm_ldi()  { assert_eq!(assemble("LDI R16, 0x0A").unwrap(), &[0xE00A]); }
+    fn asm_ldi()  { assert_eq!(assemble(&b128("LDI R16, 0x0A")).unwrap(), &[0xE00A]); }
     #[test]
-    fn asm_add()  { assert_eq!(assemble("ADD R16, R17").unwrap(), &[0x0F01]); }
+    fn asm_add()  { assert_eq!(assemble(&b128("ADD R16, R17")).unwrap(), &[0x0F01]); }
+
+    /// ATmega128A: `IN`/`OUT` use I/O offsets in equates; `LDS`/`STS` must use data-space `0x20+offset`.
+    #[test]
+    fn asm_lds_sts_adc_regs_128a_data_space() {
+        let w = assemble(&b128("LDS R16, ADCSRA")).unwrap();
+        assert_eq!(w[1], 0x0026);
+        let w2 = assemble(&b128("LDS R17, ADCL")).unwrap();
+        assert_eq!(w2[1], 0x0024);
+        let w3 = assemble(&b128("STS ADMUX, R16")).unwrap();
+        assert_eq!(w3[1], 0x0027);
+    }
+
+    #[test]
+    fn asm_lds_adc_328p_unchanged() {
+        let w = assemble(&b328("LDS R16, ADCL")).unwrap();
+        assert_eq!(w[1], 0x0078);
+    }
 
     #[test]
     fn asm_full_program() {
-        let words = assemble("LDI R16, 0x0A\nLDI R17, 0x05\nADD R16, R17\nNOP").unwrap();
+        let words = assemble(&b128("LDI R16, 0x0A\nLDI R17, 0x05\nADD R16, R17\nNOP")).unwrap();
         assert_eq!(words, &[0xE00A, 0xE015, 0x0F01, 0x0000]);
     }
 
     #[test]
     fn asm_out_porta() {
-        let words = assemble("OUT PORTA, R16").unwrap();
+        let words = assemble(&b128("OUT PORTA, R16")).unwrap();
         let op = words[0];
         assert_eq!(op & 0xF800, 0xB800);
         assert_eq!((op >> 4) & 0x1F, 16);
@@ -1577,7 +1713,7 @@ mod tests {
     #[test]
     fn asm_sbi_portb() {
         // ATmega128A: PORTB at I/O 0x18
-        let words = assemble("SBI PORTB, 5").unwrap();
+        let words = assemble(&b128("SBI PORTB, 5")).unwrap();
         assert_eq!(words.len(), 1);
         let op = words[0];
         assert_eq!(op & 0xFF00, 0x9A00);  // sbi_opc
@@ -1587,7 +1723,7 @@ mod tests {
 
     #[test]
     fn asm_328p_sbi_portb5_uno_led() {
-        let words = assemble_for_model("SBI PORTB, 5", McuModel::Atmega328P).unwrap();
+        let words = assemble(&b328("SBI PORTB, 5")).unwrap();
         assert_eq!(words.len(), 1);
         let op = words[0];
         assert_eq!(op & 0xFF00, 0x9A00);
@@ -1597,7 +1733,7 @@ mod tests {
 
     #[test]
     fn asm_328p_out_ddrb() {
-        let words = assemble_for_model("OUT DDRB, R16", McuModel::Atmega328P).unwrap();
+        let words = assemble(&b328("OUT DDRB, R16")).unwrap();
         let op = words[0];
         assert_eq!(op & 0xF800, 0xB800);
         let a = (((op >> 5) & 0x30) | (op & 0x0F)) as u8;
@@ -1605,8 +1741,31 @@ mod tests {
     }
 
     #[test]
+    fn asm_328p_tccr0a_predefines() {
+        let src = "LDI R16, (1<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00)";
+        let words = assemble(&b328(src)).unwrap();
+        let imm = (((words[0] >> 4) & 0xF0) | (words[0] & 0x0F)) as u8;
+        assert_eq!(imm, 0x83);
+    }
+
+    #[test]
+    fn asm_328p_sfr_io_addr_macro() {
+        let src = "OUT _SFR_IO_ADDR(DDRB), R16\n\
+                   OUT _SFR_IO_ADDR(SPCR), R16\n\
+                   SBI _SFR_IO_ADDR(PORTB), 2";
+        let words = assemble(&b328(src)).unwrap();
+        assert_eq!(words.len(), 3);
+        let a0 = (((words[0] >> 5) & 0x30) | (words[0] & 0x0F)) as u8;
+        let a1 = (((words[1] >> 5) & 0x30) | (words[1] & 0x0F)) as u8;
+        assert_eq!(a0, 0x04);
+        assert_eq!(a1, 0x2C);
+        assert_eq!((words[2] >> 3) & 0x1F, 0x05);
+        assert_eq!(words[2] & 0x07, 2);
+    }
+
+    #[test]
     fn asm_cbi_ddrb() {
-        let words = assemble("CBI DDRB, 3").unwrap();
+        let words = assemble(&b128("CBI DDRB, 3")).unwrap();
         let op = words[0];
         assert_eq!(op & 0xFF00, 0x9800);
         assert_eq!((op >> 3) & 0x1F, 0x17); // ddrb_io17
@@ -1616,7 +1775,7 @@ mod tests {
     #[test]
     fn asm_equ_directive() {
         let src = ".equ LED_PIN = 5\nSBI PORTB, LED_PIN";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         let op = words[0];
         assert_eq!(op & 0x07, 5);
     }
@@ -1624,7 +1783,7 @@ mod tests {
     #[test]
     fn asm_equ_ldi() {
         let src = ".equ MY_VAL = 42\nLDI R16, MY_VAL";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 1);
         // ldi_enc r16_k42 → e20a
         assert_eq!(words[0], 0xE20A);
@@ -1636,7 +1795,7 @@ mod tests {
                    LDI temp, 0\n\
                    LDI rowL, 0xFF\n\
                    MOV rowL, temp";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 3);
         assert_eq!(words[0], 0xE000); // ldi r16, 0
         assert_eq!(words[1], 0xEF1F); // ldi r17, 0xFF
@@ -1647,7 +1806,7 @@ mod tests {
     fn asm_hi8_lo8_shift_equ() {
         let src = ".equ PULSAR_DATA = 0x1234\n\
                    .db hi8(PULSAR_DATA<<1), lo8(PULSAR_DATA<<1)";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 1);
         // 0x1234<<1 = 0x2468 → hi8=0x24, lo8=0x68 → word 0x6824
         assert_eq!(words[0], 0x6824);
@@ -1658,7 +1817,7 @@ mod tests {
         let src = "NOP\n\
                    pulsar:\n\
                    .db hi8(pulsar<<1), lo8(pulsar<<1)";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 2);
         assert_eq!(words[0], 0x0000);
         assert_eq!(words[1], 0x0400);
@@ -1667,7 +1826,7 @@ mod tests {
     #[test]
     fn asm_dollar_hex() {
         // dollar_hex_ok
-        let words = assemble("LDI R16, $FF").unwrap();
+        let words = assemble(&b128("LDI R16, $FF")).unwrap();
         assert_eq!(words[0], 0xEF0F); // ldi_r16_ff
     }
 
@@ -1675,7 +1834,7 @@ mod tests {
     fn asm_low_high() {
         let src = ".equ ADDR = 0x1234\nLDI R16, low(ADDR)\nLDI R17, high(ADDR)";
         // low_high_equ → e304 e112
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 2);
         assert_eq!(words[0], 0xE304); // ldi_34
         assert_eq!(words[1], 0xE112); // ldi_12
@@ -1690,7 +1849,7 @@ mod tests {
                    LDI R18, hh8(V)\n\
                    LDI R19, hhi8(V)\n\
                    LDI R20, hlo8(V)";
-        let words = assemble(src).unwrap();
+        let words = assemble(&b128(src)).unwrap();
         assert_eq!(words.len(), 5);
         let imm = |w: u16| -> u8 { (((w >> 4) & 0xF0) | (w & 0x0F)) as u8 };
         assert_eq!(imm(words[0]), 0xEF); // lo8  of 0xDEADBEEF
@@ -1703,20 +1862,20 @@ mod tests {
         let src2 = ".equ FUNC = 0x0200\n\
                     LDI R16, pm_lo8(FUNC)\n\
                     LDI R17, pm_hi8(FUNC)";
-        let words2 = assemble(src2).unwrap();
+        let words2 = assemble(&b128(src2)).unwrap();
         assert_eq!(words2.len(), 2);
         assert_eq!(imm(words2[0]), 0x00); // (0x200 >> 1) & 0xFF = 0x00
         assert_eq!(imm(words2[1]), 0x01); // (0x200 >> 9) & 0xFF = 0x01
 
         // gs: word address (val >> 1)
         let src3 = ".equ FUNC = 0x0100\nLDI R16, lo8(gs(FUNC))";
-        let words3 = assemble(src3).unwrap();
+        let words3 = assemble(&b128(src3)).unwrap();
         assert_eq!(imm(words3[0]), 0x80); // gs(0x100) = 0x80, lo8 = 0x80
     }
 
     #[test]
     fn asm_rjmp_label() {
-        let words = assemble("loop:\n  RJMP loop").unwrap();
+        let words = assemble(&b128("loop:\n  RJMP loop")).unwrap();
         assert_eq!(words[0] & 0xF000, 0xC000);
         let k12 = words[0] & 0x0FFF;
         let k = if k12 & 0x0800 != 0 { k12 as i16 - 4096 } else { k12 as i16 };
@@ -1725,7 +1884,7 @@ mod tests {
 
     #[test]
     fn asm_breq_brne() {
-        let words = assemble("dec_loop:\n  DEC R16\n  BRNE dec_loop").unwrap();
+        let words = assemble(&b128("dec_loop:\n  DEC R16\n  BRNE dec_loop")).unwrap();
         assert_eq!(words.len(), 2);
         let brne = words[1];
         assert_eq!(brne & 0xFC07, 0xF401);
@@ -1736,7 +1895,7 @@ mod tests {
 
     #[test]
     fn asm_ld_st_indirect() {
-        let words = assemble("ST X, R16\n LD R17, X").unwrap();
+        let words = assemble(&b128("ST X, R16\n LD R17, X")).unwrap();
         assert_eq!(words.len(), 2);
         assert_eq!(words[0] & 0xFE0F, 0x920C);
         assert_eq!(words[1] & 0xFE0F, 0x900C);
@@ -1744,7 +1903,7 @@ mod tests {
 
     #[test]
     fn asm_ldd_stdy() {
-        let w = assemble("LDD R16, Y+5").unwrap();
+        let w = assemble(&b128("LDD R16, Y+5")).unwrap();
         let op = w[0];
         let q = ((op >> 8) & 0x20) | ((op >> 7) & 0x18) | (op & 0x07);
         let d = (op >> 4) & 0x1F;
@@ -1754,55 +1913,55 @@ mod tests {
 
     #[test]
     fn asm_aliases() {
-        assert!(assemble("TST R16").is_ok());
-        assert!(assemble("CLR R0").is_ok());
-        assert!(assemble("LSL R16").is_ok());
-        assert!(assemble("ROL R20").is_ok());
-        assert!(assemble("SER R16").is_ok());
+        assert!(assemble(&b128("TST R16")).is_ok());
+        assert!(assemble(&b128("CLR R0")).is_ok());
+        assert!(assemble(&b128("LSL R16")).is_ok());
+        assert!(assemble(&b128("ROL R20")).is_ok());
+        assert!(assemble(&b128("SER R16")).is_ok());
     }
 
     #[test]
     fn asm_push_pop_rcall() {
-        assert!(assemble("PUSH R16").is_ok());
-        assert!(assemble("POP R16").is_ok());
-        assert!(assemble("RCALL 5").is_ok());
-        assert!(assemble("RET").is_ok());
+        assert!(assemble(&b128("PUSH R16")).is_ok());
+        assert!(assemble(&b128("POP R16")).is_ok());
+        assert!(assemble(&b128("RCALL 5")).is_ok());
+        assert!(assemble(&b128("RET")).is_ok());
     }
 
     #[test]
     fn asm_error_unknown() {
-        assert!(assemble("MOV R0, R1").is_ok());
-        let errs = assemble("FOOBAR R0").unwrap_err();
+        assert!(assemble(&b128("MOV R0, R1")).is_ok());
+        let errs = assemble(&b128("FOOBAR R0")).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains("FOOBAR"));
     }
 
     #[test]
     fn asm_error_ldi_low_reg() {
-        let errs = assemble("LDI R0, 5").unwrap_err();
+        let errs = assemble(&b128("LDI R0, 5")).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains("R16"));
     }
 
     #[test]
     fn asm_byte_in_cseg_rejected() {
-        let errs = assemble(".BYTE 0xc3").unwrap_err();
+        let errs = assemble(&b128(".BYTE 0xc3")).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains(".BYTE"));
         assert!(errs[0].msg.contains(".CSEG"));
-        let errs2 = assemble("foo: .BYTE 1").unwrap_err();
+        let errs2 = assemble(&b128("foo: .BYTE 1")).unwrap_err();
         assert_eq!(errs2.len(), 1);
     }
 
     #[test]
     fn asm_byte_under_dseg_ok() {
-        let words = assemble(".DSEG\n.BYTE 0xc3").unwrap();
+        let words = assemble(&b128(".DSEG\n.BYTE 0xc3")).unwrap();
         assert_eq!(words, &[0x00C3]);
     }
 
     #[test]
     fn asm_db_in_cseg_ok() {
-        assert_eq!(assemble(".DB 0xc3").unwrap(), &[0x00C3]);
-        assert_eq!(assemble(".CSEG\n.DB 0x01, 0x02").unwrap(), &[0x0201]);
+        assert_eq!(assemble(&b128(".DB 0xc3")).unwrap(), &[0x00C3]);
+        assert_eq!(assemble(&b128(".CSEG\n.DB 0x01, 0x02")).unwrap(), &[0x0201]);
     }
 }

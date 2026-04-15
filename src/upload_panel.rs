@@ -1,10 +1,11 @@
 //! upload panel
 use eframe::egui::{self, Button, Color32, ComboBox, Frame, Margin, RichText, Stroke, TextEdit, Ui};
 
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::avr::McuModel;
+use crate::theme;
+use crate::theme::{START_GREEN, START_GREEN_DIM};
 
-const AMBER: Color32 = Color32::from_rgb(255, 185, 55);
-const DIM: Color32 = Color32::from_rgb(65, 65, 65);
+const DIM: Color32 = theme::DIM_GRAY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadAction {
@@ -13,7 +14,6 @@ pub enum UploadAction {
     UploadAvrdude,
 }
 
-/// USB/serial device paths for avrdude `-P`
 pub fn scan_serial_ports() -> Vec<String> {
     let mut v = Vec::new();
     #[cfg(unix)]
@@ -49,8 +49,7 @@ pub fn show_upload_panel(
     hex_rel_path: &str,
     // workspace open — upload runs assemble first, then avrdude (hex need not exist yet).
     upload_enabled: bool,
-    avrdude_part: &str,
-    mcu_label: &str,
+    assembled_board: Option<McuModel>,
     programmer: &mut String,
     port: &mut String,
     port_custom: &mut bool,
@@ -60,7 +59,7 @@ pub fn show_upload_panel(
     let mut action = UploadAction::None;
 
     Frame::NONE
-        .fill(Color32::from_rgb(3, 7, 3))
+        .fill(theme::PANEL_DEEP)
         .stroke(Stroke::new(1.0, START_GREEN_DIM))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
@@ -101,14 +100,18 @@ pub fn show_upload_panel(
                         .size(11.0)
                         .color(DIM),
                 );
+                let part_line = match assembled_board {
+                    Some(m) => format!("{}  ({})", m.avrdude_part(), m.label()),
+                    None => "—  (assemble with .board first)".to_string(),
+                };
                 ui.label(
-                    RichText::new(format!("{avrdude_part}  ({mcu_label})"))
+                    RichText::new(part_line)
                         .monospace()
                         .size(11.0)
                         .color(START_GREEN),
                 );
             });
-            if avrdude_part == "m328p" {
+            if assembled_board == Some(McuModel::Atmega328P) {
                 ui.label(
                     RichText::new("Uno built-in LED: PB5 — bitmask 0x20 (0x01 is PB0 / D8).")
                         .monospace()
@@ -206,7 +209,11 @@ pub fn show_upload_panel(
                         .size(12.0)
                         .color(if can_upload { Color32::BLACK } else { DIM }),
                 )
-                .fill(if can_upload { START_GREEN } else { Color32::from_rgb(25, 30, 25) })
+                .fill(if can_upload {
+                    START_GREEN
+                } else {
+                    theme::DISABLED_PANEL
+                })
                 .stroke(Stroke::new(1.0, if can_upload { START_GREEN } else { DIM })),
             );
             if upload_resp.clicked() {
@@ -242,11 +249,13 @@ pub fn show_upload_panel(
                         })
                         .monospace()
                         .size(10.5)
-                        .color(if status_line.contains("Error") || status_line.contains("not found") {
-                            AMBER
-                        } else {
-                            START_GREEN
-                        }),
+                        .color(
+                            if status_line.contains("Error") || status_line.contains("not found") {
+                                theme::FOCUS
+                            } else {
+                                START_GREEN
+                            },
+                        ),
                     );
                 });
 

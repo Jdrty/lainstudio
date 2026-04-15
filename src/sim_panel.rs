@@ -1,7 +1,7 @@
 //! avr_sim_panel tabs cpu ports timers sram
 
 use eframe::egui::{
-    self, Align, Align2, Button, Color32, Frame, Grid, Key, Label, Layout, Margin,
+    self, Align, Align2, Button, Color32, CornerRadius, Frame, Grid, Key, Label, Layout, Margin,
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, Window,
 };
 
@@ -9,19 +9,22 @@ use crate::avr::cpu::{
     Cpu, StepResult, SREG_C, SREG_H, SREG_I, SREG_N, SREG_S, SREG_T, SREG_V, SREG_Z,
 };
 use crate::avr::io_map;
-use crate::welcome::{START_GREEN, START_GREEN_DIM};
+use crate::avr::McuModel;
+use crate::theme;
+use crate::theme::{START_GREEN, START_GREEN_DIM};
 
-const AMBER:   Color32 = Color32::from_rgb(255, 185, 55);
-const DIM:     Color32 = Color32::from_rgb(65,  65,  65);
-const ERR_RED: Color32 = Color32::from_rgb(255, 80,  80);
-const EINK_PURPLE:     Color32 = Color32::from_rgb(180, 100, 255);
-const EINK_PURPLE_DIM: Color32 = Color32::from_rgb(90,  55,  120);
+const FOCUS: Color32 = theme::FOCUS;
+const DIM: Color32 = theme::DIM_GRAY;
+const ERR_RED: Color32 = theme::ERR_RED;
+/// Simulator-attached peripheral (PORTS tab highlight).
+const PERIPH_DOT: Color32 = Color32::from_rgb(255, 210, 72);
+const PERIPH_DIM: Color32 = Color32::from_rgb(120, 95, 40);
 
 // public_types
 const FLASH_PER_PAGE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break, Stack, Eink }
+pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break, Stack }
 
 // stack_popup_state
 pub struct StackState {
@@ -61,6 +64,29 @@ impl SpeedLimitState {
         self.value_text.trim().parse::<f64>().ok()
             .filter(|&v| v > 0.0)
             .map(|v| v * self.unit.multiplier())
+    }
+
+    pub fn ips_for_slider(&self) -> f64 {
+        self.limit_ips().unwrap_or(1_000_000.0)
+    }
+
+    pub fn set_ips_from_slider(&mut self, ips: f64, unlimited: bool) {
+        if unlimited {
+            self.enabled = false;
+            return;
+        }
+        self.enabled = true;
+        let ips = ips.clamp(1.0, 500_000_000.0);
+        if ips >= 1_000_000.0 {
+            self.unit = IpsUnit::Mips;
+            self.value_text = format!("{}", (ips / 1_000_000.0).max(1e-9));
+        } else if ips >= 1_000.0 {
+            self.unit = IpsUnit::Kips;
+            self.value_text = format!("{}", (ips / 1_000.0).max(1e-9));
+        } else {
+            self.unit = IpsUnit::Ips;
+            self.value_text = format!("{}", ips.floor().max(1.0));
+        }
     }
 }
 
@@ -149,69 +175,31 @@ pub enum SimAction {
     SetXmem(u32),
 }
 
-fn sim_green_tab_button(ui: &mut Ui, active_tab: &mut SimTab, tab: SimTab, label: &'static str) -> egui::Response {
+fn sim_tab_button(ui: &mut Ui, active_tab: &mut SimTab, tab: SimTab, label: &'static str) -> egui::Response {
     let selected = *active_tab == tab;
-    let color = if selected { START_GREEN } else { DIM };
-    let fill = if selected { Color32::from_rgb(8, 24, 8) } else { Color32::from_rgb(3, 7, 3) };
-    let stroke_col = if selected { START_GREEN } else { DIM };
+    let color = if selected { START_GREEN } else { START_GREEN_DIM };
+    let fill = if selected {
+        theme::SIM_TAB_ACTIVE
+    } else {
+        theme::SIM_SURFACE
+    };
+    let stroke_col = if selected {
+        theme::SIM_BORDER_BRIGHT
+    } else {
+        theme::SIM_BORDER
+    };
+    let sw = if selected { 1.0 } else { 0.75 };
     let resp = ui.add(
         Button::new(RichText::new(label).monospace().size(11.5).color(color))
             .fill(fill)
-            .stroke(Stroke::new(1.0, stroke_col)),
+            .stroke(Stroke::new(sw, stroke_col))
+            .corner_radius(CornerRadius::same(5)),
     );
     if resp.clicked() {
         *active_tab = tab;
     }
     resp
 }
-
-fn eink_tab_bar_button(ui: &mut Ui, active_tab: &mut SimTab) {
-    let tab = SimTab::Eink;
-    let selected = *active_tab == tab;
-    let color = if selected { EINK_PURPLE } else { EINK_PURPLE_DIM };
-    let fill = if selected { Color32::from_rgb(24, 8, 32) } else { Color32::from_rgb(8, 4, 12) };
-    let stroke_col = if selected { EINK_PURPLE } else { EINK_PURPLE_DIM };
-    let resp = ui.add(
-        Button::new(RichText::new("EINK").monospace().size(11.5).color(color))
-            .fill(fill)
-            .stroke(Stroke::new(1.0, stroke_col)),
-    );
-    if resp.clicked() {
-        *active_tab = tab;
-    }
-}
-
-fn eink_section_gap(ui: &mut Ui) {
-    ui.add_space(14.0);
-}
-
-fn eink_pin_explain_line(ui: &mut Ui, pin_fn: &str, explanation: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(pin_fn)
-                .monospace()
-                .size(11.0)
-                .color(EINK_PURPLE),
-        );
-        ui.label(
-            RichText::new(explanation)
-                .monospace()
-                .size(11.0)
-                .color(START_GREEN_DIM),
-        );
-    });
-}
-
-fn eink_section_heading(ui: &mut Ui, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .strong()
-            .monospace()
-            .size(13.5)
-            .color(START_GREEN),
-    );
-}
-
 
 pub fn show_sim_panel(
     ui:            &mut Ui,
@@ -225,36 +213,35 @@ pub fn show_sim_panel(
     bp_state:      &mut BreakpointState,
     stack_state:   &mut StackState,
     xmem_state:    &mut XmemState,
-    ed060sc4:      bool,
-    ed060_display_open: &mut bool,
+    peripheral_pins: &[(char, u8)],
+    assembled_board: Option<McuModel>,
 ) -> SimAction {
     let mut action = SimAction::None;
 
     Frame::NONE
-        .fill(Color32::from_rgb(3, 7, 3))
-        .stroke(Stroke::new(1.0, START_GREEN_DIM))
+        .fill(theme::PANEL_DEEP)
+        .stroke(Stroke::new(0.75, theme::SIM_BORDER))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
             ui.horizontal(|ui| {
+                let title = match assembled_board {
+                    Some(m) => format!("[ AVR SIM  {} ]", m.label()),
+                    None => "[ AVR SIM ]".to_string(),
+                };
                 ui.label(
-                    RichText::new(format!("[ AVR SIM  {} ]", cpu.model.label()))
+                    RichText::new(title)
                         .monospace()
                         .size(13.0)
                         .color(START_GREEN),
                 );
-                if ed060sc4 {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        eink_tab_bar_button(ui, active_tab);
-                    });
-                }
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("PC  {:04X}", cpu.pc))
-                        .monospace().size(12.5).color(AMBER),
+                        .monospace().size(12.5).color(FOCUS),
                 );
                 ui.add_space(12.0);
                 ui.label(
@@ -281,9 +268,9 @@ pub fn show_sim_panel(
                     (SimTab::Flash,  "FLASH"),
                     (SimTab::Break,  "BREAK"),
                 ] {
-                    sim_green_tab_button(ui, active_tab, tab, label);
+                    sim_tab_button(ui, active_tab, tab, label);
                 }
-                sim_green_tab_button(ui, active_tab, SimTab::Stack, "STACK");
+                sim_tab_button(ui, active_tab, SimTab::Stack, "STACK");
             });
             ui.separator();
             ui.add_space(4.0);
@@ -295,15 +282,18 @@ pub fn show_sim_panel(
                 .auto_shrink([false, false])
                 .max_height(avail_h.max(120.0))
                 .show(ui, |ui| -> SimAction {
+                    let board_known = assembled_board.is_some();
                     match *active_tab {
-                        SimTab::Cpu    => { show_cpu_tab(ui, cpu, last_result); SimAction::None }
-                        SimTab::Ports  => { show_ports_tab(ui, cpu, ed060sc4);    SimAction::None }
+                        SimTab::Cpu    => { show_cpu_tab(ui, cpu, last_result, board_known); SimAction::None }
+                        SimTab::Ports  => {
+                            show_ports_tab(ui, cpu, peripheral_pins);
+                            SimAction::None
+                        }
                         SimTab::Timers => show_timers_tab(ui, cpu),
-                        SimTab::Sram   => show_sram_tab(ui, cpu, xmem_state),
-                        SimTab::Flash  => { show_flash_tab(ui, cpu, flash_state); SimAction::None }
+                        SimTab::Sram   => show_sram_tab(ui, cpu, xmem_state, board_known),
+                        SimTab::Flash  => { show_flash_tab(ui, cpu, flash_state, board_known); SimAction::None }
                         SimTab::Break  => { show_break_tab(ui, bp_state);       SimAction::None }
                         SimTab::Stack  => show_stack_tab(ui, cpu, stack_state),
-                        SimTab::Eink   => { show_eink_tab(ui, ed060_display_open); SimAction::None }
                     }
                 }).inner;
             if action == SimAction::None { action = tab_action; }
@@ -329,10 +319,11 @@ pub fn show_sim_panel(
                 if auto_running {
                     if ui.add(
                         Button::new(
-                            RichText::new("\u{25A0} STOP").monospace().size(12.5).color(AMBER),
+                            RichText::new("\u{25A0} STOP").monospace().size(12.5).color(START_GREEN),
                         )
-                        .fill(Color32::from_rgb(30, 12, 0))
-                        .stroke(Stroke::new(1.5, AMBER)),
+                        .fill(theme::SIM_STOP_FILL)
+                        .stroke(Stroke::new(1.0, theme::SIM_STOP_BORDER))
+                        .corner_radius(CornerRadius::same(5)),
                     ).clicked() {
                         action = SimAction::AutoToggle;
                     }
@@ -340,8 +331,9 @@ pub fn show_sim_panel(
                     Button::new(
                         RichText::new("\u{25B6} AUTO").monospace().size(12.5).color(START_GREEN),
                     )
-                    .fill(Color32::from_rgb(6, 20, 6))
-                    .stroke(Stroke::new(1.5, START_GREEN)),
+                    .fill(theme::SIM_SURFACE_LIFT)
+                    .stroke(Stroke::new(1.0, theme::SIM_BORDER_BRIGHT))
+                    .corner_radius(CornerRadius::same(5)),
                 ).clicked() {
                     action = SimAction::AutoToggle;
                 }
@@ -350,7 +342,7 @@ pub fn show_sim_panel(
                     RichText::new(fmt_ips(ips, auto_running))
                         .monospace()
                         .size(12.0)
-                        .color(if auto_running { AMBER } else { DIM }),
+                        .color(if auto_running { FOCUS } else { DIM }),
                 );
             });
             // speed-limit row
@@ -394,7 +386,7 @@ pub fn show_sim_panel(
 
 // cpu_tab
 
-fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
+fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>, board_known: bool) {
     section_label(ui, "REGISTERS");
     ui.add_space(4.0);
     Grid::new("sim_regs")
@@ -427,7 +419,7 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
             ("V", SREG_V), ("N", SREG_N), ("Z", SREG_Z), ("C", SREG_C),
         ] {
             let set = (cpu.sreg >> bit) & 1 != 0;
-            let color = if set { AMBER } else { DIM };
+            let color = if set { FOCUS } else { DIM };
             ui.label(
                 RichText::new(format!("{name}:{}", (cpu.sreg >> bit) & 1))
                     .monospace().size(12.5).color(color),
@@ -441,23 +433,41 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
 
     section_label(ui, "FLASH DISASM");
     ui.add_space(4.0);
-    let pc    = cpu.pc;
-    let start = pc.saturating_sub(3);
-    for addr in start..start + 8 {
-        if addr as usize >= cpu.flash_words() { break; }
-        let is_current = addr == pc;
-        let arrow  = if is_current { "\u{2192}" } else { " " };
-        let op     = cpu.flash[addr as usize];
-        let disasm = cpu.disasm_at(addr);
-        let cyc    = Cpu::instr_cycles_str(op);
-        let color  = if is_current { AMBER } else { START_GREEN_DIM };
-        let ivt_ann = cpu.ivt_name(addr as u32)
-            .map(|n| format!("  ; <{n}>"))
-            .unwrap_or_default();
+    if !board_known {
         ui.label(
-            RichText::new(format!("{arrow} {:04X}  {:<18} [{:>5}]{ivt_ann}", addr, disasm, format!("{cyc}cy")))
-                .monospace().size(12.0).color(color),
+            RichText::new("  (assemble with a `.board` line to show word addresses, disasm, and vector names)")
+                .monospace()
+                .size(10.5)
+                .color(DIM),
         );
+        ui.add_space(4.0);
+        for _ in 0..8 {
+            ui.label(
+                RichText::new("   ???  ???                  [???]")
+                    .monospace()
+                    .size(12.0)
+                    .color(START_GREEN_DIM),
+            );
+        }
+    } else {
+        let pc    = cpu.pc;
+        let start = pc.saturating_sub(3);
+        for addr in start..start + 8 {
+            if addr as usize >= cpu.flash_words() { break; }
+            let is_current = addr == pc;
+            let arrow  = if is_current { "\u{2192}" } else { " " };
+            let op     = cpu.flash[addr as usize];
+            let disasm = cpu.disasm_at(addr);
+            let cyc    = Cpu::instr_cycles_str(op);
+            let color  = if is_current { FOCUS } else { START_GREEN_DIM };
+            let ivt_ann = cpu.ivt_name(addr as u32)
+                .map(|n| format!("  ; <{n}>"))
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!("{arrow} {:04X}  {:<18} [{:>5}]{ivt_ann}", addr, disasm, format!("{cyc}cy")))
+                    .monospace().size(12.0).color(color),
+            );
+        }
     }
 
     if let Some(res) = last_result {
@@ -472,7 +482,7 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
             StepResult::Halted => {
                 ui.label(
                     RichText::new("! HALTED (PC out of Flash)")
-                        .monospace().size(11.5).color(AMBER),
+                        .monospace().size(11.5).color(FOCUS),
                 );
             }
             StepResult::Ok => {}
@@ -482,145 +492,14 @@ fn show_cpu_tab(ui: &mut Ui, cpu: &Cpu, last_result: Option<StepResult>) {
 
 // ports_tab
 
-fn ed060_gpio_pin(port: &str, bit: u8) -> bool {
-    match port {
-        "B" => matches!(bit, 0 | 5 | 6 | 7),
-        "D" => true,
-        "E" => bit >= 2,
-        _ => false,
-    }
+fn is_periph_pin(peripheral_pins: &[(char, u8)], name: &str, bit: u8) -> bool {
+    let Some(pc) = name.chars().next() else {
+        return false;
+    };
+    peripheral_pins.iter().any(|(p, b)| *p == pc && *b == bit)
 }
 
-fn show_eink_tab(ui: &mut Ui, display_open: &mut bool) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("ED060SC4  (800×600)")
-                .strong()
-                .monospace()
-                .size(14.0)
-                .color(EINK_PURPLE),
-        );
-        ui.add_space((ui.available_width() - 118.0).max(0.0));
-        let btn = ui.add(
-            Button::new(
-                RichText::new("Open display")
-                    .monospace()
-                    .size(11.5)
-                    .color(EINK_PURPLE),
-            )
-            .fill(Color32::from_rgb(18, 8, 28))
-            .stroke(Stroke::new(1.0, EINK_PURPLE_DIM)),
-        );
-        if btn.clicked() {
-            *display_open = true;
-        }
-    });
-    ui.add_space(8.0);
-    eink_section_heading(ui, "VERTICAL INIT (BEFORE PIXEL DATA)");
-    ui.add_space(4.0);
-    eink_pin_explain_line(
-        ui,
-        "PE5 GMODE",
-        " — high enables row (TFT) gate drivers; low after a frame / before next (reduces ghosting)",
-    );
-    ui.add_space(2.0);
-    eink_pin_explain_line(ui, "PE3 SPV", " — low prepares the start pulse; high again after the sync CKV");
-    ui.add_space(2.0);
-    eink_pin_explain_line(
-        ui,
-        "PE4 CKV",
-        " — one pulse (↓ while SPV low) syncs vertical pointer to row 0; later ↓ advances row",
-    );
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new(
-            "Order: GMODE↑ → SPV↓ → CKV pulse → SPV↑. Simulator: CKV↓ with SPV low resets row to 0",
-        )
-        .monospace()
-        .size(10.5)
-        .color(START_GREEN_DIM),
-    );
-    eink_section_gap(ui);
-    eink_section_heading(ui, "ONE ROW (800 PX = 200 BYTES ON PD)");
-    ui.add_space(4.0);
-    eink_pin_explain_line(
-        ui,
-        "PB0 SPH",
-        " — low starts horizontal scan; high ends it. CL clocks are ignored while SPH is high",
-    );
-    ui.add_space(2.0);
-    eink_pin_explain_line(
-        ui,
-        "PD0–PD7",
-        " — each byte = 4 pixels @ 2 bpp: 00 hold, 01 black, 10 white, 11 unused (hold)",
-    );
-    ui.add_space(2.0);
-    eink_pin_explain_line(ui, "PB6 CL", " — rising edge samples PD into the shift chain (200× per row)");
-    ui.add_space(2.0);
-    eink_pin_explain_line(
-        ui,
-        "PB5 LE",
-        " — pulse high→low; falling edge copies the shift register to the column drivers",
-    );
-    ui.add_space(2.0);
-    eink_pin_explain_line(
-        ui,
-        "PE2 OE",
-        " — high applies waveform to microcapsules; falling edge commits latched row to the sim FB",
-    );
-    ui.add_space(2.0);
-    eink_pin_explain_line(
-        ui,
-        "PE4 CKV",
-        " — after OE↓: CKV↓ with SPV high advances the active row (0…599)",
-    );
-    eink_section_gap(ui);
-    eink_section_heading(ui, "POWER & WAVEFORM");
-    ui.add_space(4.0);
-    eink_pin_explain_line(
-        ui,
-        "PB7",
-        " — panel 3.3 V rail enable (power); simulator ignores pixel updates unless GMODE and PB7 are high",
-    );
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new(
-            "You should try to send full black then full white before anything else, einks are weird :shrug:",
-        )
-        .monospace()
-        .size(10.5)
-        .color(START_GREEN_DIM),
-    );
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(
-            "Power-down: GMODE low when idle. Firmware timing (e.g. ~20 µs after OE↑) is not modele, only pin edges and order matter",
-        )
-        .monospace()
-        .size(10.5)
-        .color(START_GREEN_DIM),
-    );
-    eink_section_gap(ui);
-    ui.separator();
-    ui.add_space(4.0);
-    eink_section_heading(ui, "ROW LOOP (×600)");
-    ui.add_space(4.0);
-    for s in [
-        "1) SPH↓ (reset byte index) → 200× (PD byte, CL↑) → SPH↑",
-        "2) LE pulse → latch row",
-        "3) CKV↑ → OE↑ → (waveform delay in hardware) → OE↓ → CKV↓ → next row",
-    ] {
-        ui.label(
-            RichText::new(s)
-                .monospace()
-                .size(11.0)
-                .color(START_GREEN_DIM),
-        );
-        ui.add_space(2.0);
-    }
-}
-
-fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
+fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, peripheral_pins: &[(char, u8)]) {
     section_label(ui, "GPIO PORTS  (DDR=0 INPUT, DDR=1 OUTPUT)");
     ui.add_space(6.0);
 
@@ -642,9 +521,9 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
     ui.separator();
 
     for &(name, port_addr, ddr_addr, pin_addr) in cpu.gpio_ports() {
-        let port = cpu.read_mem(port_addr);
-        let ddr  = cpu.read_mem(ddr_addr);
-        let pin  = cpu.read_mem(pin_addr);
+        let port = cpu.peek_mem(port_addr);
+        let ddr  = cpu.peek_mem(ddr_addr);
+        let pin  = cpu.peek_mem(pin_addr);
 
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -660,12 +539,12 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
                         "G" => bit < 3,
                         _ => false,
                     };
-                let eink_pin = ed060_on && ed060_gpio_pin(name, bit);
+                let periph_pin = is_periph_pin(peripheral_pins, name, bit);
                 let is_out = (ddr >> bit) & 1 != 0;
                 let high   = if is_out { (port >> bit) & 1 != 0 }
                              else      { (pin  >> bit) & 1 != 0 };
                 let (ch, col) = if is_out {
-                    if high { ('\u{2588}', AMBER) } else { ('\u{2591}', START_GREEN_DIM) }
+                    if high { ('\u{2588}', FOCUS) } else { ('\u{2591}', START_GREEN_DIM) }
                 } else {
                     ('\u{00B7}', DIM)
                 };
@@ -699,21 +578,21 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
                                     .color(Color32::TRANSPARENT),
                             )
                         }
-                    } else if eink_pin {
+                    } else if periph_pin {
                         if is_out {
                             if high {
                                 Label::new(
                                     RichText::new('\u{2588}'.to_string())
                                         .monospace()
                                         .size(13.0)
-                                        .color(EINK_PURPLE),
+                                        .color(PERIPH_DOT),
                                 )
                             } else {
                                 Label::new(
                                     RichText::new(ALT_OUT_LOW.to_string())
                                         .monospace()
                                         .size(13.0)
-                                        .color(EINK_PURPLE_DIM),
+                                        .color(PERIPH_DIM),
                                 )
                             }
                         } else {
@@ -731,9 +610,9 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
                     if xmem_pin && !is_out {
                         ui.painter()
                             .circle_filled(resp.rect.center(), dot_r, ERR_RED);
-                    } else if eink_pin && !is_out {
+                    } else if periph_pin && !is_out {
                         ui.painter()
-                            .circle_filled(resp.rect.center(), dot_r, EINK_PURPLE);
+                            .circle_filled(resp.rect.center(), dot_r, PERIPH_DOT);
                     }
                 });
                 if bit > 0 {
@@ -759,15 +638,13 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, ed060_on: bool) {
                 .color(ERR_RED),
         );
     }
-    if ed060_on {
+    if !peripheral_pins.is_empty() {
         ui.add_space(2.0);
         ui.label(
-            RichText::new(
-                "  purple \u{2588} / \u{2504} / dot — ED060SC4 (PB0 SPH,5 LE,6 CL,7 3.3V  PD  PE2 OE,3 SPV,4 CKV,5 GMODE…PE7)",
-            )
-            .monospace()
-            .size(10.5)
-            .color(EINK_PURPLE),
+            RichText::new("  yellow \u{2588} / \u{2504} / dot — attached peripheral (Peripherals panel)")
+                .monospace()
+                .size(10.5)
+                .color(PERIPH_DOT),
         );
     }
 }
@@ -945,9 +822,10 @@ fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
 
     let mut trig_btn = |ui: &mut Ui, label: &str, addr: u16, mask: u8| {
         if ui.add(
-            Button::new(RichText::new(label).monospace().size(11.0).color(Color32::BLACK))
-                .fill(START_GREEN_DIM)
-                .stroke(Stroke::new(1.0, START_GREEN)),
+            Button::new(RichText::new(label).monospace().size(11.0).color(START_GREEN))
+                .fill(theme::SIM_SURFACE_LIFT)
+                .stroke(Stroke::new(0.75, theme::SIM_BORDER_BRIGHT))
+                .corner_radius(CornerRadius::same(5)),
         ).clicked() {
             action = SimAction::SetIoBit { addr, mask };
         }
@@ -1005,7 +883,85 @@ fn xmem_portc_pins(size: u32) -> u8 {
 }
 
 // sram_tab
-fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
+fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState, board_known: bool) -> SimAction {
+    if !board_known {
+        ui.label(
+            RichText::new(
+                "Assemble with a `.board` line to see SRAM size, address range, contents, and EEPROM layout.",
+            )
+            .monospace()
+            .size(10.5)
+            .color(DIM),
+        );
+        ui.add_space(6.0);
+        section_label(ui, "EXTERNAL SRAM (XMEM)");
+        ui.label(
+            RichText::new("  (size and pins depend on MCU — shown after assemble.)")
+                .monospace()
+                .size(10.0)
+                .color(DIM),
+        );
+        ui.add_space(6.0);
+        section_label(ui, "SRAM  0x???? – 0x????  (??? bytes)");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("SP →").monospace().size(12.0).color(FOCUS));
+            ui.label(
+                RichText::new("???")
+                    .monospace()
+                    .size(12.0)
+                    .color(START_GREEN_DIM),
+            );
+        });
+        ui.add_space(4.0);
+        Grid::new("sram_grid_unknown")
+            .num_columns(10)
+            .spacing([5.0, 1.5])
+            .show(ui, |ui| {
+                ui.label(RichText::new("ADDR").monospace().size(11.0).color(START_GREEN_DIM));
+                for col in 0..8usize {
+                    ui.label(
+                        RichText::new(format!("+{col:X}"))
+                            .monospace()
+                            .size(11.0)
+                            .color(START_GREEN_DIM),
+                    );
+                }
+                ui.label(RichText::new("").monospace().size(11.0).color(DIM));
+                ui.end_row();
+                for _ in 0..12 {
+                    ui.label(
+                        RichText::new("????")
+                            .monospace()
+                            .size(11.0)
+                            .color(START_GREEN_DIM),
+                    );
+                    for _ in 0..8 {
+                        ui.label(
+                            RichText::new("??")
+                                .monospace()
+                                .size(11.0)
+                                .color(DIM),
+                        );
+                    }
+                    ui.label(RichText::new("").monospace().size(11.0).color(DIM));
+                    ui.end_row();
+                }
+            });
+        ui.add_space(6.0);
+        section_label(ui, "EEPROM  0x??? – 0x???  (??? bytes, non-volatile)");
+        ui.add_space(4.0);
+        for _ in 0..8 {
+            ui.label(
+                RichText::new("   ???  ?? ?? ?? ?? ?? ?? ?? ??")
+                    .monospace()
+                    .size(10.5)
+                    .color(START_GREEN_DIM),
+            );
+        }
+        return SimAction::None;
+    }
+
     let mut action = SimAction::None;
     let sp = cpu.sp;
     let ram_start = cpu.ram_start();
@@ -1067,17 +1023,30 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         let can_enable = input_ok;
         if ui.add_enabled(
             can_enable,
-            Button::new(RichText::new("ENABLE XMEM").monospace().size(11.0).color(Color32::BLACK))
-                .fill(if xmem_active { AMBER } else { START_GREEN_DIM })
-                .stroke(Stroke::new(1.0, START_GREEN)),
+            Button::new(RichText::new("ENABLE XMEM").monospace().size(11.0).color(START_GREEN))
+                .fill(if xmem_active {
+                    theme::SIM_SURFACE_LIFT
+                } else {
+                    theme::SIM_SURFACE
+                })
+                .stroke(Stroke::new(
+                    1.0,
+                    if xmem_active {
+                        theme::SIM_BORDER_BRIGHT
+                    } else {
+                        theme::SIM_BORDER
+                    },
+                ))
+                .corner_radius(CornerRadius::same(5)),
         ).clicked() {
             if let Some(sz) = parsed_size { action = SimAction::SetXmem(sz); }
         }
         ui.add_space(6.0);
         if ui.add(
-            Button::new(RichText::new("DISABLE").monospace().size(11.0).color(Color32::BLACK))
-                .fill(DIM)
-                .stroke(Stroke::new(1.0, DIM)),
+            Button::new(RichText::new("DISABLE").monospace().size(11.0).color(START_GREEN_DIM))
+                .fill(theme::SIM_SURFACE)
+                .stroke(Stroke::new(0.75, theme::SIM_BORDER))
+                .corner_radius(CornerRadius::same(5)),
         ).clicked() {
             action = SimAction::SetXmem(0);
         }
@@ -1085,7 +1054,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(format!("ACTIVE  {xmem_size} B  (0x{xmem_base:04X}–0x{:04X})", xmem_base + xmem_size - 1))
-                    .monospace().size(11.0).color(AMBER),
+                    .monospace().size(11.0).color(FOCUS),
             );
         }
         });
@@ -1127,9 +1096,9 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
         }
 
         // conflict_detection
-        let ddra  = cpu.read_mem(io_map::DDRA);
-        let ddrc  = cpu.read_mem(io_map::DDRC);
-        let ddrg  = cpu.read_mem(io_map::DDRG);
+        let ddra  = cpu.peek_mem(io_map::DDRA);
+        let ddrc  = cpu.peek_mem(io_map::DDRC);
+        let ddrg  = cpu.peek_mem(io_map::DDRG);
 
         let conflict_a = ddra != 0;
         let conflict_c = portc_n > 0 && (ddrc & portc_mask) != 0;
@@ -1170,7 +1139,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("SP →").monospace().size(12.0).color(AMBER));
+        ui.label(RichText::new("SP →").monospace().size(12.0).color(FOCUS));
         ui.label(
             RichText::new(format!("0x{sp:04X}"))
                 .monospace().size(12.0).color(START_GREEN),
@@ -1244,7 +1213,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 skipping = false;
 
                 // addr_col
-                let addr_color = if is_sp_row { AMBER } else { START_GREEN_DIM };
+                let addr_color = if is_sp_row { FOCUS } else { START_GREEN_DIM };
                 ui.label(
                     RichText::new(format!("{addr:04X}"))
                         .monospace().size(11.0).color(addr_color),
@@ -1254,7 +1223,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 for (col_idx, &b) in slice.iter().enumerate() {
                     let byte_addr = addr + col_idx as u32;
                     let is_sp_byte = byte_addr == sp as u32;
-                    let color = if is_sp_byte { AMBER }
+                    let color = if is_sp_byte { FOCUS }
                                 else if b != 0 { START_GREEN }
                                 else { DIM };
                     ui.label(
@@ -1267,7 +1236,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
                 if is_sp_row {
                     ui.label(
                         RichText::new(format!("\u{2190} SP {:04X}", sp))
-                            .monospace().size(10.5).color(AMBER),
+                            .monospace().size(10.5).color(FOCUS),
                     );
                 } else {
                     ui.label(RichText::new("").monospace().size(11.0).color(DIM));
@@ -1350,7 +1319,7 @@ fn show_sram_tab(ui: &mut Ui, cpu: &Cpu, xmem: &mut XmemState) -> SimAction {
             skipping = false;
             let mut line = format!("  0x{base:03X}   ");
             for b in slice { line.push_str(&format!(" {b:02X}  ")); }
-            ui.label(RichText::new(line).monospace().size(10.5).color(AMBER));
+            ui.label(RichText::new(line).monospace().size(10.5).color(FOCUS));
         }
     }
 
@@ -1369,8 +1338,8 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
     section_label(ui, "STACK POINTER");
     ui.add_space(4.0);
     Grid::new("sp_grid").num_columns(3).spacing([16.0, 2.0]).show(ui, |ui| {
-        ui.label(RichText::new(format!("SPH  0x{sph:02X}")).monospace().size(13.0).color(AMBER));
-        ui.label(RichText::new(format!("SPL  0x{spl:02X}")).monospace().size(13.0).color(AMBER));
+        ui.label(RichText::new(format!("SPH  0x{sph:02X}")).monospace().size(13.0).color(FOCUS));
+        ui.label(RichText::new(format!("SPL  0x{spl:02X}")).monospace().size(13.0).color(FOCUS));
         ui.label(
             RichText::new(format!("SP = 0x{sp:04X}")).monospace().size(13.0).color(START_GREEN),
         );
@@ -1394,9 +1363,10 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
 
     ui.add_space(6.0);
     if ui.add(
-        Button::new(RichText::new("STACK FRAMES").monospace().size(11.5).color(Color32::BLACK))
-            .fill(START_GREEN_DIM)
-            .stroke(Stroke::new(1.0, START_GREEN)),
+        Button::new(RichText::new("STACK FRAMES").monospace().size(11.5).color(START_GREEN))
+            .fill(theme::SIM_SURFACE_LIFT)
+            .stroke(Stroke::new(1.0, theme::SIM_BORDER_BRIGHT))
+            .corner_radius(CornerRadius::same(5)),
     ).clicked() {
         s.popup_open = true;
     }
@@ -1428,7 +1398,7 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
             let row_base = row * row_width;
             let sp_row = sp >= row_base as u16 && (sp as usize) < row_base + row_width
                          && sp >= ram_start;
-            let color_row = if sp_row { AMBER } else { START_GREEN };
+            let color_row = if sp_row { FOCUS } else { START_GREEN };
 
             let mut line = format!("  0x{row_base:04X}  ");
             let mut has_content = false;
@@ -1464,8 +1434,8 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
             .title_bar(false)
             .frame(
                 Frame::NONE
-                    .fill(Color32::from_rgb(3, 8, 3))
-                    .stroke(Stroke::new(1.5, START_GREEN_DIM))
+                    .fill(theme::PANEL_DEEP)
+                    .stroke(Stroke::new(1.0, theme::SIM_BORDER))
                     .inner_margin(Margin::same(14)),
             )
             .fixed_size([480.0, 420.0])
@@ -1477,7 +1447,7 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
                             .monospace().size(13.0).color(START_GREEN),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(RichText::new("✕").monospace().size(13.0).color(AMBER))
+                        if ui.button(RichText::new("✕").monospace().size(13.0).color(FOCUS))
                             .clicked()
                         {
                             s.popup_open = false;
@@ -1525,7 +1495,7 @@ fn show_stack_tab(ui: &mut Ui, cpu: &Cpu, s: &mut StackState) -> SimAction {
                                         RichText::new(format!(
                                             "0x{addr:04X}  {lo:02X} {hi:02X}  → RET 0x{word_addr:04X}"
                                         ))
-                                        .monospace().size(10.5).color(AMBER),
+                                        .monospace().size(10.5).color(FOCUS),
                                     );
                                     ui.label(
                                         RichText::new(format!("  {disasm} [{cyc}cy]"))
@@ -1606,8 +1576,9 @@ fn show_break_tab(ui: &mut Ui, bp: &mut BreakpointState) {
             ui.add_space(4.0);
             if ui.add(
                 Button::new(RichText::new("ADD").monospace().size(11.5).color(START_GREEN))
-                    .fill(Color32::from_rgb(6, 20, 6))
-                    .stroke(Stroke::new(1.0, START_GREEN)),
+                    .fill(theme::SIM_SURFACE_LIFT)
+                    .stroke(Stroke::new(1.0, theme::SIM_BORDER_BRIGHT))
+                    .corner_radius(CornerRadius::same(5)),
             ).clicked() {
                 let addr_str = bp.new_addr_text.trim().trim_start_matches("0x");
                 if let Ok(addr) = u16::from_str_radix(addr_str, 16) {
@@ -1639,7 +1610,7 @@ fn show_break_tab(ui: &mut Ui, bp: &mut BreakpointState) {
     for (i, b) in bp.breakpoints.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.checkbox(&mut b.enabled, "");
-            let addr_col = if b.enabled { AMBER } else { DIM };
+            let addr_col = if b.enabled { FOCUS } else { DIM };
             ui.label(
                 RichText::new(format!("0x{:04X}", b.addr))
                     .monospace().size(11.5).color(addr_col),
@@ -1670,9 +1641,10 @@ fn show_break_tab(ui: &mut Ui, bp: &mut BreakpointState) {
     ui.add_space(6.0);
     if !bp.breakpoints.is_empty() {
         if ui.add(
-            Button::new(RichText::new("CLEAR ALL").monospace().size(10.5).color(DIM))
+            Button::new(RichText::new("CLEAR ALL").monospace().size(10.5).color(START_GREEN_DIM))
                 .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::new(1.0, DIM)),
+                .stroke(Stroke::new(0.75, theme::SIM_BORDER))
+                .corner_radius(CornerRadius::same(5)),
         ).clicked() {
             bp.breakpoints.clear();
         }
@@ -1680,10 +1652,40 @@ fn show_break_tab(ui: &mut Ui, bp: &mut BreakpointState) {
 }
 
 // flash
-fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
-    // header
+fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState, board_known: bool) {
     let flash_words = cpu.flash_words();
     let flash_total_pages = flash_words.div_ceil(FLASH_PER_PAGE);
+
+    if !board_known {
+        section_label(ui, "FLASH  0x????–0x????  (??? words)  page ?/?");
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("  Assemble with a `.board` line to show flash bounds, paging, and disassembly.")
+                .monospace()
+                .size(10.5)
+                .color(DIM),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("   ADDR  WORDS         DISASM")
+                .monospace()
+                .size(11.0)
+                .color(START_GREEN_DIM),
+        );
+        ui.separator();
+        ui.add_space(2.0);
+        for _ in 0..16 {
+            ui.label(
+                RichText::new("   ???  ??? ???  ???")
+                    .monospace()
+                    .size(12.0)
+                    .color(START_GREEN_DIM),
+            );
+        }
+        return;
+    }
+
+    // header
     section_label(ui, &format!(
         "FLASH  0x0000–0x{:04X}  ({} words)  page {}/{}",
         flash_words.saturating_sub(1), flash_words, s.page + 1, flash_total_pages,
@@ -1712,7 +1714,7 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
         if s.page >= 5 && s.page < flash_total_pages.saturating_sub(1) {
             ui.label(
                 RichText::new(format!("[{}]", s.page + 1))
-                    .monospace().size(11.0).color(AMBER),
+                    .monospace().size(11.0).color(FOCUS),
             );
             ui.add_space(2.0);
         }
@@ -1808,7 +1810,7 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
         let ivt    = cpu.ivt_name(addr)
             .map(|n| format!("  ; <{n}>"))
             .unwrap_or_default();
-        let (color, size) = if is_pc { (AMBER, 12.5_f32) } else { (START_GREEN, 12.0_f32) };
+        let (color, size) = if is_pc { (FOCUS, 12.5_f32) } else { (START_GREEN, 12.0_f32) };
 
         ui.label(
             RichText::new(format!("{arrow}  {addr:04X}  {words_str}  {disasm}{ivt}"))
@@ -1832,13 +1834,23 @@ fn show_flash_tab(ui: &mut Ui, cpu: &Cpu, s: &mut FlashState) {
 
 // format helper
 fn flash_page_btn(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
-    let color  = if selected { AMBER }                          else { START_GREEN_DIM };
-    let fill   = if selected { Color32::from_rgb(30, 20, 0) }  else { Color32::from_rgb(6, 16, 6) };
-    let stroke  = if selected { AMBER }                         else { DIM };
+    let color = if selected { FOCUS } else { START_GREEN_DIM };
+    let fill = if selected {
+        theme::SIM_TAB_ACTIVE
+    } else {
+        theme::SIM_SURFACE
+    };
+    let stroke_col = if selected {
+        theme::SIM_BORDER_BRIGHT
+    } else {
+        theme::SIM_BORDER
+    };
+    let sw = if selected { 1.0 } else { 0.75 };
     ui.add(
         Button::new(RichText::new(label).monospace().size(11.5).color(color))
             .fill(fill)
-            .stroke(Stroke::new(1.0, stroke)),
+            .stroke(Stroke::new(sw, stroke_col))
+            .corner_radius(CornerRadius::same(5)),
     )
 }
 
@@ -1861,7 +1873,7 @@ fn kv3(ui: &mut Ui, key: &str, val: &str, ann: &str) {
     let vcolor = if val.trim_start_matches('0').is_empty() || val == "0000" || val == "00" {
         DIM
     } else {
-        AMBER
+        FOCUS
     };
     ui.label(RichText::new(val).monospace().size(11.0).color(vcolor));
     ui.label(RichText::new(ann).monospace().size(11.0).color(DIM));
@@ -1869,7 +1881,7 @@ fn kv3(ui: &mut Ui, key: &str, val: &str, ann: &str) {
 }
 
 fn flag_lbl(ui: &mut Ui, name: &str, set: bool) {
-    let color = if set { AMBER } else { DIM };
+    let color = if set { FOCUS } else { DIM };
     ui.label(
         RichText::new(format!("{name}:{}", u8::from(set)))
             .monospace().size(11.0).color(color),
@@ -1892,20 +1904,26 @@ fn t2_cs_str(cs: u8) -> &'static str {
     }
 }
 
-fn retro_btn(ui: &mut Ui, label: &str) -> egui::Response {
+/// Same styling as [`crate::upload_panel`] `big_btn`: dim fill, bright border, black label.
+fn sim_big_btn(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add(
-        Button::new(RichText::new(label).monospace().size(12.0).color(START_GREEN))
-            .fill(Color32::from_rgb(6, 16, 6))
-            .stroke(Stroke::new(1.0, START_GREEN_DIM)),
+        Button::new(
+            RichText::new(label)
+                .monospace()
+                .size(12.0)
+                .color(Color32::BLACK),
+        )
+        .fill(START_GREEN_DIM)
+        .stroke(Stroke::new(1.0, START_GREEN)),
     )
 }
 
+fn retro_btn(ui: &mut Ui, label: &str) -> egui::Response {
+    sim_big_btn(ui, label)
+}
+
 fn assemble_btn(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.add(
-        Button::new(RichText::new(label).monospace().size(12.5).color(START_GREEN))
-            .fill(Color32::from_rgb(8, 24, 8))
-            .stroke(Stroke::new(1.0, START_GREEN)),
-    )
+    sim_big_btn(ui, label)
 }
 
 fn fmt_ips(ips: f64, running: bool) -> String {

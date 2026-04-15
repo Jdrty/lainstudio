@@ -1,19 +1,18 @@
 //! entry
 
 mod avr;
-mod boot_video;
 mod cycle_helper;
 mod docs;
-mod ed060sc4_display;
-mod ed060sc4_sim;
 mod editor;
 mod gui;
+mod modal_chrome;
+mod peripherals;
 mod sim_panel;
 mod syntax;
+mod theme;
 mod toolbar;
 mod upload_panel;
-mod welcome;
-mod welcome_font;
+mod waveforms;
 mod word_helper;
 
 fn main() -> eframe::Result {
@@ -22,8 +21,8 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Lain Studio",
+        "Full Metal Studio",
         native_options,
-        Box::new(|cc| Ok(Box::new(gui::LainApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(gui::FullMetalApp::new(cc)))),
     )
 }

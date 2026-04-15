@@ -1,8 +1,8 @@
 [package]
-name = "lainstudio_gui"
+name = "full_metal_studio_gui"
 version = "0.1.0"
 edition = "2021"
-description = "Immediate-mode GUI window (egui / eframe)"
+description = "Full Metal Studio — immediate-mode GUI (egui / eframe)"
 rust-version = "1.76"
 
 [dependencies]
@@ -11,6 +11,8 @@ egui = "0.31"
 egui_extras = { version = "0.31", default-features = true, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 2
