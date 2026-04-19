@@ -4,6 +4,8 @@
 //! step_n: no step() wrapper, unchecked flash, skip redundant wrapping_add
 //! run_timed: 100k_step batches, one Instant::now per batch
 
+use std::collections::VecDeque;
+
 use super::{io_map, McuModel};
 
 pub const FLASH_WORDS: usize = 65_536;
@@ -53,6 +55,118 @@ pub struct Cpu {
     pin_input_override: Vec<(u16, u8, bool)>,
     /// Millivolts 0–5000 per ADC channel (from virtual potentiometers); `None` = 0 V.
     adc_channel_mv: [Option<u32>; 16],
+    /// USART0 — virtual RX/TX (ATmega328P: USART0 only; ATmega128A: USART0 + USART1).
+    pub usart0: UsartPort,
+    pub usart1: UsartPort,
+}
+
+/// Host-side RX FIFO (into MCU) and TX queue (MCU → host), plus async TX timing.
+#[derive(Clone)]
+pub struct UsartPort {
+    pub rx:           VecDeque<u8>,
+    pub tx_to_host:   VecDeque<u8>,
+    tx_byte:          Option<u8>,
+    tx_deadline:      u64,
+    /// Transmit complete (TXC0/TXC1); cleared when starting a new TX or by writing 1 to TXC.
+    txc_pending:      bool,
+}
+
+impl Default for UsartPort {
+    fn default() -> Self {
+        Self {
+            rx:          VecDeque::new(),
+            tx_to_host:  VecDeque::new(),
+            tx_byte:     None,
+            tx_deadline: 0,
+            txc_pending: false,
+        }
+    }
+}
+
+struct UsartAddrs {
+    udr:   u16,
+    ucsra: u16,
+    ucsrb: u16,
+    ubrrl: u16,
+    ubrrh: u16,
+}
+
+fn usart_addrs(model: McuModel, port: u8) -> Option<UsartAddrs> {
+    match (model, port) {
+        (McuModel::Atmega328P, 0) => Some(UsartAddrs {
+            udr:   io_map::UDR0_328P,
+            ucsra: io_map::UCSR0A_328P,
+            ucsrb: io_map::UCSR0B_328P,
+            ubrrl: io_map::UBRR0L_328P,
+            ubrrh: io_map::UBRR0H_328P,
+        }),
+        (McuModel::Atmega128A, 0) => Some(UsartAddrs {
+            udr:   io_map::UDR0,
+            ucsra: io_map::UCSR0A,
+            ucsrb: io_map::UCSR0B,
+            ubrrl: io_map::UBRR0L,
+            ubrrh: io_map::UBRR0H,
+        }),
+        (McuModel::Atmega128A, 1) => Some(UsartAddrs {
+            udr:   io_map::UDR1,
+            ucsra: io_map::UCSR1A,
+            ucsrb: io_map::UCSR1B,
+            ubrrl: io_map::UBRR1L,
+            ubrrh: io_map::UBRR1H,
+        }),
+        _ => None,
+    }
+}
+
+fn io_idx(addr: u16) -> usize {
+    (addr - 0x0020) as usize
+}
+
+/// reset USART-related I/O bytes (datasheet power-on defaults: UCSZn = 8N1, UDRE=1)
+fn usart_init_io_defaults(model: McuModel, io: &mut [u8; IO_SIZE]) {
+    match model {
+        McuModel::Atmega328P => {
+            io[io_idx(io_map::UCSR0A_328P)] = 0x20;
+            io[io_idx(io_map::UCSR0B_328P)] = 0x00;
+            io[io_idx(io_map::UCSR0C_328P)] = 0x06;
+            io[io_idx(io_map::UBRR0L_328P)] = 0x00;
+            io[io_idx(io_map::UBRR0H_328P)] = 0x00;
+        }
+        McuModel::Atmega128A => {
+            io[io_idx(io_map::UCSR0A)] = 0x20;
+            io[io_idx(io_map::UCSR0B)] = 0x00;
+            io[io_idx(io_map::UCSR0C)] = 0x06;
+            io[io_idx(io_map::UBRR0L)] = 0x00;
+            io[io_idx(io_map::UBRR0H)] = 0x00;
+            io[io_idx(io_map::UCSR1A)] = 0x20;
+            io[io_idx(io_map::UCSR1B)] = 0x00;
+            io[io_idx(io_map::UCSR1C)] = 0x06;
+            io[io_idx(io_map::UBRR1L)] = 0x00;
+            io[io_idx(io_map::UBRR1H)] = 0x00;
+        }
+    }
+}
+
+fn usart_port_for_udr(model: McuModel, addr: u16) -> Option<u8> {
+    for port in 0u8..2u8 {
+        if let Some(a) = usart_addrs(model, port) {
+            if a.udr == addr {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+fn usart_port_for_ucsra(model: McuModel, addr: u16) -> Option<u8> {
+    for port in 0u8..2u8 {
+        if let Some(a) = usart_addrs(model, port) {
+            if a.ucsra == addr {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 impl Default for Cpu { fn default() -> Self { Self::new() } }
@@ -67,7 +181,7 @@ impl Cpu {
             McuModel::Atmega128A => (SRAM_BYTES_128A, EEPROM_BYTES_128A, 0x10FFu16),
             McuModel::Atmega328P => (SRAM_BYTES_328P, EEPROM_BYTES_328P, 0x08FFu16),
         };
-        Self {
+        let mut cpu = Self {
             model,
             flash:  vec![0u16; FLASH_WORDS],
             regs:   [0u8; 32],
@@ -83,7 +197,11 @@ impl Cpu {
             eemwe_timer: 0,
             pin_input_override: Vec::new(),
             adc_channel_mv: [None; 16],
-        }
+            usart0: UsartPort::default(),
+            usart1: UsartPort::default(),
+        };
+        usart_init_io_defaults(model, &mut cpu.io);
+        cpu
     }
 
 
@@ -139,6 +257,9 @@ impl Cpu {
         self.eemwe_timer       = 0;
         self.pin_input_override.clear();
         self.adc_channel_mv = [None; 16];
+        self.usart0 = UsartPort::default();
+        self.usart1 = UsartPort::default();
+        usart_init_io_defaults(self.model, &mut self.io);
     }
 
     pub fn configure_xmem(&mut self, size: u32) {
@@ -165,12 +286,20 @@ impl Cpu {
     pub fn read_mem_raw(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x001F => self.regs[addr as usize],
-            0x0020..=0x00FF => match addr {
+            0x0020..=0x00FF => {
+                if let Some(v) = self.peek_udr_for(addr) {
+                    return v;
+                }
+                if let Some(v) = self.raw_read_ucsra(addr) {
+                    return v;
+                }
+                match addr {
                 io_map::SPL  => self.sp as u8,
                 io_map::SPH  => (self.sp >> 8) as u8,
                 io_map::SREG => self.sreg,
                 _            => self.io[(addr - 0x0020) as usize],
-            },
+                }
+            }
             _ => {
                 let ram_start = self.ram_start();
                 let ram_end = self.ram_end();
@@ -292,10 +421,16 @@ impl Cpu {
             self.try_complete_adc_conversion_if_busy();
         }
         self.maybe_complete_adc_on_read(addr);
+        if let Some(v) = self.read_udr_if(addr) {
+            return v;
+        }
         self.peek_mem(addr)
     }
 
     pub fn write_mem(&mut self, addr: u16, val: u8) {
+        if self.try_usart_write(addr, val) {
+            return;
+        }
         match addr {
             0x0000..=0x001F => self.regs[addr as usize] = val,
             0x0020..=0x00FF => match addr {
@@ -305,6 +440,14 @@ impl Cpu {
                 io_map::TIFR  => self.io[(io_map::TIFR - 0x0020) as usize] &= !val,
                 io_map::ETIFR => self.io[(io_map::ETIFR - 0x0020) as usize] &= !val,
                 io_map::EECR  => self.eecr_write(val),
+                addr if self.model == McuModel::Atmega328P
+                    && matches!(
+                        addr,
+                        io_map::TIFR0_328P | io_map::TIFR1_328P | io_map::TIFR2_328P
+                    ) =>
+                {
+                    self.io[(addr - 0x0020) as usize] &= !val;
+                }
                 _             => self.io[(addr - 0x0020) as usize] = val,
             },
             _ => {
@@ -321,6 +464,172 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    fn peek_udr_for(&self, addr: u16) -> Option<u8> {
+        let port = usart_port_for_udr(self.model, addr)?;
+        let a = usart_addrs(self.model, port)?;
+        if self.io[io_idx(a.ucsrb)] & 0x10 == 0 {
+            return Some(0);
+        }
+        let p = match port {
+            0 => &self.usart0,
+            1 => &self.usart1,
+            _ => return None,
+        };
+        Some(p.rx.front().copied().unwrap_or(0))
+    }
+
+    fn raw_read_ucsra(&self, addr: u16) -> Option<u8> {
+        let port = usart_port_for_ucsra(self.model, addr)?;
+        Some(self.ucsra_combined(port))
+    }
+
+    fn ucsra_combined(&self, port: u8) -> u8 {
+        let Some(a) = usart_addrs(self.model, port) else {
+            return 0;
+        };
+        let stored = self.io[io_idx(a.ucsra)] & 0x03;
+        let ucsrb = self.io[io_idx(a.ucsrb)];
+        let txen = ucsrb & 0x08 != 0;
+        let rxen = ucsrb & 0x10 != 0;
+        let p = match port {
+            0 => &self.usart0,
+            1 => &self.usart1,
+            _ => return stored,
+        };
+        let rxc = rxen && !p.rx.is_empty();
+        let udre = if txen { p.tx_byte.is_none() } else { true };
+        let txc = if txen { p.txc_pending } else { false };
+        stored | ((rxc as u8) << 7) | ((txc as u8) << 6) | ((udre as u8) << 5)
+    }
+
+    fn read_udr_if(&mut self, addr: u16) -> Option<u8> {
+        let port = usart_port_for_udr(self.model, addr)?;
+        let a = usart_addrs(self.model, port)?;
+        if self.io[io_idx(a.ucsrb)] & 0x10 == 0 {
+            return Some(0);
+        }
+        let p = match port {
+            0 => &mut self.usart0,
+            1 => &mut self.usart1,
+            _ => return None,
+        };
+        Some(p.rx.pop_front().unwrap_or(0))
+    }
+
+    fn try_usart_write(&mut self, addr: u16, val: u8) -> bool {
+        if usart_port_for_udr(self.model, addr).is_some() {
+            let port = usart_port_for_udr(self.model, addr).unwrap();
+            self.usart_write_udr(port, val);
+            return true;
+        }
+        if let Some(port) = usart_port_for_ucsra(self.model, addr) {
+            self.usart_write_ucsra(port, val);
+            return true;
+        }
+        false
+    }
+
+    fn usart_write_ucsra(&mut self, port: u8, val: u8) {
+        let Some(a) = usart_addrs(self.model, port) else {
+            return;
+        };
+        let ix = io_idx(a.ucsra);
+        self.io[ix] = (self.io[ix] & !0x03) | (val & 0x03);
+        if val & 0x40 != 0 {
+            match port {
+                0 => self.usart0.txc_pending = false,
+                1 => self.usart1.txc_pending = false,
+                _ => {}
+            }
+        }
+    }
+
+    fn usart_write_udr(&mut self, port: u8, val: u8) {
+        let Some(a) = usart_addrs(self.model, port) else {
+            return;
+        };
+        if self.io[io_idx(a.ucsrb)] & 0x08 == 0 {
+            return;
+        }
+        let cycles = self.usart_tx_byte_cycles(port);
+        let cyc = self.cycles;
+        let p = match port {
+            0 => &mut self.usart0,
+            1 => &mut self.usart1,
+            _ => return,
+        };
+        if p.tx_byte.is_some() {
+            return;
+        }
+        p.tx_byte = Some(val);
+        p.txc_pending = false;
+        p.tx_deadline = cyc.saturating_add(cycles);
+    }
+
+    fn usart_tx_byte_cycles(&self, port: u8) -> u64 {
+        let Some(a) = usart_addrs(self.model, port) else {
+            return 1;
+        };
+        let ucsra = self.io[io_idx(a.ucsra)];
+        let ubrr = ((self.io[io_idx(a.ubrrh)] as u16) << 8) | (self.io[io_idx(a.ubrrl)] as u16);
+        let u2x = ucsra & 0x02 != 0;
+        let div = if u2x { 8u64 } else { 16u64 };
+        let bits = 10u64;
+        let scale = (ubrr as u64).saturating_add(1).max(1);
+        bits.saturating_mul(div).saturating_mul(scale).max(1)
+    }
+
+    /// Push incoming bytes from the host UART panel into the MCU RX buffer.
+    pub fn usart_rx_host_push(&mut self, port: u8, b: u8) {
+        let p = match port {
+            0 => &mut self.usart0,
+            1 => &mut self.usart1,
+            _ => return,
+        };
+        if p.rx.len() < 256 {
+            p.rx.push_back(b);
+        }
+    }
+
+    /// Drain bytes the firmware transmitted (MCU → host terminal).
+    pub fn usart_drain_tx_to_host(&mut self, port: u8, out: &mut Vec<u8>) {
+        let p = match port {
+            0 => &mut self.usart0,
+            1 => &mut self.usart1,
+            _ => return,
+        };
+        out.extend(p.tx_to_host.drain(..));
+    }
+
+    fn tick_usart(&mut self) {
+        self.tick_usart_port(0);
+        if self.model == McuModel::Atmega128A {
+            self.tick_usart_port(1);
+        }
+    }
+
+    fn tick_usart_port(&mut self, port: u8) {
+        if usart_addrs(self.model, port).is_none() {
+            return;
+        }
+        let p = match port {
+            0 => &mut self.usart0,
+            1 => &mut self.usart1,
+            _ => return,
+        };
+        if p.tx_byte.is_none() {
+            return;
+        }
+        if self.cycles < p.tx_deadline {
+            return;
+        }
+        let Some(b) = p.tx_byte.take() else {
+            return;
+        };
+        p.tx_to_host.push_back(b);
+        p.txc_pending = true;
     }
 
     // eeprom_peripheral
@@ -471,6 +780,7 @@ impl Cpu {
             self.pc += 1;
             ran += 1;
             let r = self.decode_execute(op);
+            self.tick_timers();
             hook(self);
             if r != StepResult::Ok { return (ran, r); }
         }
@@ -608,6 +918,9 @@ impl Cpu {
                 0x0036 => Some("TIMER3_COMPB"),
                 0x0038 => Some("TIMER3_COMPC"),
                 0x003A => Some("TIMER3_OVF"),
+                0x003C => Some("USART1_RX"),
+                0x003E => Some("USART1_UDRE"),
+                0x0040 => Some("USART1_TX"),
                 _ => None,
             },
             McuModel::Atmega328P => match addr {
@@ -645,7 +958,7 @@ impl Cpu {
     #[inline(always)]
     pub fn ivt_end_word(&self) -> u32 {
         match self.model {
-            McuModel::Atmega128A => 0x003A, // byte 0x0074
+            McuModel::Atmega128A => 0x0040, // USART1_TX
             McuModel::Atmega328P => 0x0019, // byte 0x0032
         }
     }
@@ -664,12 +977,20 @@ impl Cpu {
         let elapsed = self.cycles.wrapping_sub(self.timer_last_cycles);
         if elapsed == 0 { return; }
         self.timer_last_cycles = self.cycles;
-        Self::tick_t0(&mut self.io, elapsed);
-        Self::tick_t1(&mut self.io, elapsed);
-        Self::tick_t2(&mut self.io, elapsed);
-        if self.has_timer3() {
-            Self::tick_t3(&mut self.io, elapsed);
+        match self.model {
+            McuModel::Atmega128A => {
+                Self::tick_t0_m128a(&mut self.io, elapsed);
+                Self::tick_t1_m128a(&mut self.io, elapsed);
+                Self::tick_t2_m128a(&mut self.io, elapsed);
+                Self::tick_t3(&mut self.io, elapsed);
+            }
+            McuModel::Atmega328P => {
+                Self::tick_t0_m328p(&mut self.io, elapsed);
+                Self::tick_t1_m328p(&mut self.io, elapsed);
+                Self::tick_t2_m328p(&mut self.io, elapsed);
+            }
         }
+        self.tick_usart();
     }
 
     // data_addr_to_io_index
@@ -679,7 +1000,7 @@ impl Cpu {
     // timer0_8bit
     // tifr tov0=0 ocf0=1
     // tccr0 cs0 prescale wgm01 ctc
-    fn tick_t0(io: &mut [u8; IO_SIZE], elapsed: u64) {
+    fn tick_t0_m128a(io: &mut [u8; IO_SIZE], elapsed: u64) {
         let tccr0 = io[Self::ii(io_map::TCCR0)];
         let div: u64 = match tccr0 & 0x07 {
             1 => 1, 2 => 8, 3 => 64, 4 => 256, 5 => 1024,
@@ -717,7 +1038,7 @@ impl Cpu {
     // timer1_16bit best timer ^_^
     // tifr tov1=2 ocf1b=3 ocf1a=4
     // tccr1b cs1 wgm12 ctc_ocr1a
-    fn tick_t1(io: &mut [u8; IO_SIZE], elapsed: u64) {
+    fn tick_t1_m128a(io: &mut [u8; IO_SIZE], elapsed: u64) {
         let tccr1b = io[Self::ii(io_map::TCCR1B)];
         let div: u64 = match tccr1b & 0x07 {
             1 => 1, 2 => 8, 3 => 64, 4 => 256, 5 => 1024,
@@ -773,7 +1094,7 @@ impl Cpu {
     // timer2_8bit worst timer ￢_￢
     // tifr tov2=6 ocf2=7
     // prescale 1 8 32 64 128 256 1024
-    fn tick_t2(io: &mut [u8; IO_SIZE], elapsed: u64) {
+    fn tick_t2_m128a(io: &mut [u8; IO_SIZE], elapsed: u64) {
         let tccr2 = io[Self::ii(io_map::TCCR2)];
         let div: u64 = match tccr2 & 0x07 {
             1 => 1, 2 => 8, 3 => 32, 4 => 64, 5 => 128, 6 => 256, 7 => 1024,
@@ -805,6 +1126,155 @@ impl Cpu {
         }
     }
 
+    fn tick_t0_m328p(io: &mut [u8; IO_SIZE], elapsed: u64) {
+        let tccr0b = io[Self::ii(io_map::TCCR0B_328P)];
+        let div: u64 = match tccr0b & 0x07 {
+            1 => 1, 2 => 8, 3 => 64, 4 => 256, 5 => 1024,
+            _ => return,
+        };
+        let ticks = elapsed / div;
+        if ticks == 0 { return; }
+
+        let tccr0a = io[Self::ii(io_map::TCCR0A_328P)];
+        let wgm = (tccr0a & 0x03) | (((tccr0b >> 3) & 1) << 2);
+        let ctc = wgm == 2;
+        let tcnt = io[Self::ii(io_map::TCNT0_328P)] as u64;
+        let ocr = io[Self::ii(io_map::OCR0A_328P)] as u64;
+        let tifr0 = Self::ii(io_map::TIFR0_328P);
+
+        if ctc {
+            let period = (ocr + 1).max(1);
+            let new_raw = tcnt + ticks;
+            io[Self::ii(io_map::TCNT0_328P)] = (new_raw % period) as u8;
+            if new_raw >= period {
+                io[tifr0] |= 0x02; // OCF0A
+            }
+        } else {
+            let new_raw = tcnt + ticks;
+            io[Self::ii(io_map::TCNT0_328P)] = (new_raw % 256) as u8;
+            if new_raw >= 256 {
+                io[tifr0] |= 0x01; // TOV0
+            }
+            if (tcnt <= ocr && new_raw > ocr) || new_raw >= 256 {
+                io[tifr0] |= 0x02; // OCF0A
+            }
+        }
+        Self::apply_oc0a_328p(io);
+    }
+
+    fn apply_oc0a_328p(io: &mut [u8; IO_SIZE]) {
+        let tccr0a = io[Self::ii(io_map::TCCR0A_328P)];
+        let tccr0b = io[Self::ii(io_map::TCCR0B_328P)];
+        let wgm = (tccr0a & 0x03) | (((tccr0b >> 3) & 1) << 2);
+        if wgm != 3 {
+            return;
+        }
+        let com = (tccr0a >> 6) & 0x03;
+        if com < 2 {
+            return;
+        }
+        const DDRD_328P: usize = 0x002A - 0x0020;
+        const PORTD_328P: usize = 0x002B - 0x0020;
+        if io[DDRD_328P] & 0x40 == 0 {
+            return;
+        }
+        let tcnt = io[Self::ii(io_map::TCNT0_328P)] as u16;
+        let ocr = io[Self::ii(io_map::OCR0A_328P)] as u16;
+        let high = match com {
+            2 => tcnt < ocr,
+            3 => tcnt >= ocr,
+            _ => return,
+        };
+        io[PORTD_328P] = (io[PORTD_328P] & !0x40) | (u8::from(high) << 6);
+    }
+
+    fn tick_t1_m328p(io: &mut [u8; IO_SIZE], elapsed: u64) {
+        let tccr1b = io[Self::ii(io_map::TCCR1B_328P)];
+        let div: u64 = match tccr1b & 0x07 {
+            1 => 1, 2 => 8, 3 => 64, 4 => 256, 5 => 1024,
+            _ => return,
+        };
+        let ticks = elapsed / div;
+        if ticks == 0 { return; }
+
+        let ctc = (tccr1b & 0x08) != 0;
+        let tcnt = {
+            let lo = io[Self::ii(io_map::TCNT1L_328P)] as u64;
+            let hi = io[Self::ii(io_map::TCNT1H_328P)] as u64;
+            (hi << 8) | lo
+        };
+        let ocr1a = {
+            let lo = io[Self::ii(io_map::OCR1AL_328P)] as u64;
+            let hi = io[Self::ii(io_map::OCR1AH_328P)] as u64;
+            (hi << 8) | lo
+        };
+        let ocr1b = {
+            let lo = io[Self::ii(io_map::OCR1BL_328P)] as u64;
+            let hi = io[Self::ii(io_map::OCR1BH_328P)] as u64;
+            (hi << 8) | lo
+        };
+        let tifr1 = Self::ii(io_map::TIFR1_328P);
+
+        if ctc {
+            let period = (ocr1a + 1).max(1);
+            let new_raw = tcnt + ticks;
+            let new16 = (new_raw % period) as u16;
+            io[Self::ii(io_map::TCNT1L_328P)] = new16 as u8;
+            io[Self::ii(io_map::TCNT1H_328P)] = (new16 >> 8) as u8;
+            if new_raw >= period {
+                io[tifr1] |= 0x02; // OCF1A
+            }
+        } else {
+            let new_raw = tcnt + ticks;
+            let new16 = (new_raw % 65536) as u16;
+            io[Self::ii(io_map::TCNT1L_328P)] = new16 as u8;
+            io[Self::ii(io_map::TCNT1H_328P)] = (new16 >> 8) as u8;
+            if new_raw >= 65536 {
+                io[tifr1] |= 0x01; // TOV1
+            }
+            if (tcnt <= ocr1a && new_raw > ocr1a) || new_raw >= 65536 {
+                io[tifr1] |= 0x02; // OCF1A
+            }
+            if (tcnt <= ocr1b && new_raw > ocr1b) || new_raw >= 65536 {
+                io[tifr1] |= 0x04; // OCF1B
+            }
+        }
+    }
+
+    fn tick_t2_m328p(io: &mut [u8; IO_SIZE], elapsed: u64) {
+        let tccr2b = io[Self::ii(io_map::TCCR2B_328P)];
+        let div: u64 = match tccr2b & 0x07 {
+            1 => 1, 2 => 8, 3 => 32, 4 => 64, 5 => 128, 6 => 256, 7 => 1024,
+            _ => return,
+        };
+        let ticks = elapsed / div;
+        if ticks == 0 { return; }
+
+        let tccr2a = io[Self::ii(io_map::TCCR2A_328P)];
+        let wgm = (tccr2a & 0x03) | (((tccr2b >> 3) & 1) << 2);
+        let ctc = wgm == 2;
+        let tcnt = io[Self::ii(io_map::TCNT2_328P)] as u64;
+        let ocr = io[Self::ii(io_map::OCR2A_328P)] as u64;
+        let tifr2 = Self::ii(io_map::TIFR2_328P);
+
+        if ctc {
+            let period = (ocr + 1).max(1);
+            let new_raw = tcnt + ticks;
+            io[Self::ii(io_map::TCNT2_328P)] = (new_raw % period) as u8;
+            if new_raw >= period {
+                io[tifr2] |= 0x02; // OCF2A
+            }
+        } else {
+            let new_raw = tcnt + ticks;
+            io[Self::ii(io_map::TCNT2_328P)] = (new_raw % 256) as u8;
+            if new_raw >= 256 {
+                io[tifr2] |= 0x01; // TOV2
+            }
+            if (tcnt <= ocr && new_raw > ocr) || new_raw >= 256 {
+                io[tifr2] |= 0x02; // OCF2A
+            }
+        }
+    }
 
     // timer3_16bit same_as_t1_with_c_channel
     // etifr tov3=4 ocf3a=3 ocf3b=2 ocf3c=1
@@ -1707,6 +2177,40 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::avr::io_map;
+    use crate::avr::McuModel;
+
+    #[test]
+    fn m328p_timer0_uses_tccr0_not_legacy_timer2_slots() {
+        let mut cpu = Cpu::new_for_model(McuModel::Atmega328P);
+        cpu.io[(io_map::TCCR0A_328P - 0x0020) as usize] = 0x83;
+        cpu.io[(io_map::TCCR0B_328P - 0x0020) as usize] = 0x01;
+        cpu.io[(io_map::OCR0A_328P - 0x0020) as usize] = 0x40;
+        cpu.io[(io_map::TCNT0_328P - 0x0020) as usize] = 0;
+        cpu.io[(0x002A - 0x0020) as usize] = 0x40; // DDRD PD6 output
+
+        assert_eq!(cpu.io[(io_map::TCCR2B_328P - 0x0020) as usize], 0);
+
+        cpu.timer_last_cycles = 0;
+        cpu.cycles = 20;
+        cpu.tick_timers();
+
+        assert!(
+            cpu.io[(io_map::TCNT0_328P - 0x0020) as usize] > 0,
+            "TCNT0 should advance when TCCR0B.CS is non-zero"
+        );
+        assert_eq!(
+            cpu.io[(io_map::TCNT2_328P - 0x0020) as usize],
+            0,
+            "Timer2 TCNT2 should not move when Timer2 clock is off"
+        );
+        assert_eq!(
+            cpu.io[(io_map::TCCR2B_328P - 0x0020) as usize],
+            0,
+            "Timer0 setup must not have been applied to TCCR2B (legacy bug)"
+        );
+        assert_ne!(cpu.io[(0x002B - 0x0020) as usize] & 0x40, 0);
+    }
 
     #[test]
     fn test_nop() {
@@ -1811,5 +2315,19 @@ mod tests {
         assert_eq!(cpu.regs[16], 0x42);
         cpu.step();
         assert_eq!(cpu.pc, 1);
+    }
+
+    /// `step_n` / `step_n_hook` must call `tick_timers` like `step` so USART TX completes (UDRE, MCU→host).
+    #[test]
+    fn step_n_hook_advances_usart_tx() {
+        let mut cpu = Cpu::new_for_model(McuModel::Atmega328P);
+        cpu.write_mem(io_map::UCSR0B_328P, 0x08);
+        cpu.write_mem(io_map::UBRR0L_328P, 0);
+        cpu.write_mem(io_map::UBRR0H_328P, 0);
+        cpu.write_mem(io_map::UDR0_328P, b'X');
+        assert!(cpu.usart0.tx_byte.is_some());
+        cpu.step_n(500);
+        assert!(cpu.usart0.tx_byte.is_none());
+        assert_eq!(cpu.usart0.tx_to_host[0], b'X');
     }
 }

@@ -32,6 +32,7 @@ use crate::sim_panel::{
     SpeedLimitState, StackState, XmemState,
 };
 use crate::toolbar::{show_toolbar, ToolbarAction};
+use crate::uart_panel::{append_uart_tx_to_scrollback, show_uart_panel, UartPanelState};
 use crate::upload_panel::{scan_serial_ports, show_upload_panel, UploadAction};
 use crate::word_helper::{show_word_helper, WordHelperState};
 use crate::modal_chrome::{
@@ -222,6 +223,9 @@ pub struct FullMetalApp {
     /// right panel: waveform traces
     show_waveforms: bool,
     waveform_state: WaveformState,
+    /// right panel: virtual USART terminal
+    show_uart: bool,
+    uart_state: UartPanelState,
     /// right panel: firmware hex + avrdude (replaces SIM / helpers while open)
     show_upload: bool,
     upload_programmer: String,
@@ -272,6 +276,8 @@ impl FullMetalApp {
             peripheral_state: PeripheralState::default(),
             show_waveforms: false,
             waveform_state: WaveformState::default(),
+            show_uart: false,
+            uart_state: UartPanelState::default(),
             show_upload: false,
             upload_programmer: "arduino".to_string(),
             upload_port: String::new(),
@@ -342,6 +348,10 @@ impl FullMetalApp {
         self.sim_tab = SimTab::Cpu;
         self.waveform_state = WaveformState::default();
         self.show_waveforms = false;
+        self.uart_state.rx0.clear();
+        self.uart_state.rx1.clear();
+        self.uart_state.line0.clear();
+        self.uart_state.line1.clear();
     }
 
     fn enter_editor(&mut self, workspace: Workspace) {
@@ -839,6 +849,7 @@ impl FullMetalApp {
                     self.show_upload = false;
                     self.show_peripherals = false;
                     self.show_waveforms = false;
+                    self.show_uart = false;
                     self.show_word_helper  = false;
                     self.show_cycle_helper = false;
                 }
@@ -849,6 +860,7 @@ impl FullMetalApp {
                     self.show_sim = false;
                     self.show_upload = false;
                     self.show_waveforms = false;
+                    self.show_uart = false;
                     self.show_word_helper = false;
                     self.show_cycle_helper = false;
                 }
@@ -859,6 +871,18 @@ impl FullMetalApp {
                     self.show_sim = false;
                     self.show_upload = false;
                     self.show_peripherals = false;
+                    self.show_uart = false;
+                    self.show_word_helper = false;
+                    self.show_cycle_helper = false;
+                }
+            }
+            ToolbarAction::UartTogglePanel => {
+                self.show_uart = !self.show_uart;
+                if self.show_uart {
+                    self.show_sim = false;
+                    self.show_upload = false;
+                    self.show_peripherals = false;
+                    self.show_waveforms = false;
                     self.show_word_helper = false;
                     self.show_cycle_helper = false;
                 }
@@ -869,6 +893,7 @@ impl FullMetalApp {
                     self.show_sim = false;
                     self.show_peripherals = false;
                     self.show_waveforms = false;
+                    self.show_uart = false;
                     self.show_word_helper = false;
                     self.show_cycle_helper = false;
                 }
@@ -882,6 +907,7 @@ impl FullMetalApp {
                     self.show_sim          = false;
                     self.show_peripherals = false;
                     self.show_waveforms = false;
+                    self.show_uart = false;
                     self.show_upload = false;
                     self.show_cycle_helper = false;
                 }
@@ -892,6 +918,7 @@ impl FullMetalApp {
                     self.show_sim         = false;
                     self.show_peripherals = false;
                     self.show_waveforms = false;
+                    self.show_uart = false;
                     self.show_upload = false;
                     self.show_word_helper = false;
                 }
@@ -1224,6 +1251,7 @@ impl eframe::App for FullMetalApp {
                         self.show_sim,
                         self.show_peripherals,
                         self.show_waveforms,
+                        self.show_uart,
                         self.show_upload,
                         self.show_word_helper || self.show_cycle_helper,
                         self.assembled_board,
@@ -1289,13 +1317,15 @@ impl eframe::App for FullMetalApp {
         let rhs_open = self.show_sim
             || self.show_peripherals
             || self.show_waveforms
+            || self.show_uart
             || self.show_word_helper
             || self.show_cycle_helper
             || self.show_upload;
 
         if rhs_open {
+            let rhs_w = 360.0;
             egui::SidePanel::right("rhs_panel")
-                .exact_width(360.0)
+                .exact_width(rhs_w)
                 .resizable(false)
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
@@ -1312,6 +1342,18 @@ impl eframe::App for FullMetalApp {
                             &mut self.upload_port_custom,
                             &ports,
                             &self.upload_status_line,
+                        );
+                    } else if self.show_uart {
+                        let model = self.mcu_model_from_editor();
+                        sim_action = show_uart_panel(
+                            ui,
+                            &mut self.sim,
+                            model,
+                            &mut self.uart_state,
+                            self.assembled_board,
+                            self.auto_running,
+                            self.ips,
+                            &mut self.speed_limit,
                         );
                     } else if self.show_sim {
                         let peripheral_pins = self.peripheral_state.pin_occupancy();
@@ -1588,6 +1630,14 @@ impl eframe::App for FullMetalApp {
             }
 
             ctx.request_repaint(); // auto_run_repaint
+        }
+
+        if self.show_uart {
+            let model = self.mcu_model_from_editor();
+            let n = append_uart_tx_to_scrollback(&mut self.sim, model, &mut self.uart_state);
+            if n > 0 {
+                ctx.request_repaint();
+            }
         }
 
         show_flash_locations_window(ctx, &mut self.show_flash_locations, self.assembled_board, &self.sim);

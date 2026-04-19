@@ -23,6 +23,7 @@ pub enum ToolbarAction {
     SimTogglePanel,
     PeripheralsTogglePanel,
     WaveformsTogglePanel,
+    UartTogglePanel,
     UploadTogglePanel,
     DocsFlashLocations,
     HelpersWordHelper,
@@ -59,7 +60,8 @@ pub fn show_toolbar(
     sim_visible:        bool,
     peripherals_visible: bool,
     waveforms_visible:   bool,
-    upload_visible:     bool,
+    uart_visible:        bool,
+    upload_visible:      bool,
     helpers_visible:    bool,
     assembled_board:   Option<McuModel>,
 ) -> ToolbarAction {
@@ -147,6 +149,19 @@ pub fn show_toolbar(
                     .clicked()
                 {
                     action = ToolbarAction::WaveformsTogglePanel;
+                }
+
+                let uart_label = if uart_visible { "UART ▪" } else { "UART" };
+                if ui
+                    .add(eframe::egui::Button::new(
+                        RichText::new(uart_label)
+                            .font(title_font(18.0))
+                            .color(START_GREEN),
+                    )
+                    .frame(false))
+                    .clicked()
+                {
+                    action = ToolbarAction::UartTogglePanel;
                 }
 
                 let upload_label = if upload_visible { "UPLOAD ▪" } else { "UPLOAD" };

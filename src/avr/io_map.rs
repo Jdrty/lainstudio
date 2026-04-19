@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 //! I/O maps: ATmega128A (`IO_NAMES`, `PORTS`) and ATmega328P (`IO_NAMES_328P`, `PORTS_328P`).
+//! USART: ATmega328P uses mem-mapped `UCSR0A_328P`…`UDR0_328P`; ATmega128A adds `UCSR0C`, USART1 (`UCSR1A`…`UDR1`).
 //! std_io 0x20_5f io_off data_minus_20 sbi_cbi_to_data_3f ext_io 0x60_ff ld_st
 
 use super::McuModel;
@@ -101,6 +102,8 @@ pub const UCSR1A: u16 = 0x009B; // USART1 Control/Status A
 pub const UDR1:   u16 = 0x009C; // USART1 Data Register
 
 pub const UBRR0H: u16 = 0x0090; // USART0 Baud Rate High
+/// USART0 Control/Status C — extended I/O (LDS/STS only on ATmega128A)
+pub const UCSR0C: u16 = 0x0095;
 
 pub const TCCR3A: u16 = 0x008B; // Timer3 Control A
 pub const TCCR3B: u16 = 0x008A; // Timer3 Control B
@@ -254,6 +257,40 @@ pub const PORTS_328P: [(&str, u16, u16, u16); 3] = [
     ("C", io_to_mem(0x08), io_to_mem(0x07), io_to_mem(0x06)),
     ("D", io_to_mem(0x0B), io_to_mem(0x0A), io_to_mem(0x09)),
 ];
+
+pub const TCCR0A_328P: u16 = 0x0044;
+pub const TCCR0B_328P: u16 = 0x0045;
+pub const TCNT0_328P: u16 = 0x0046;
+pub const OCR0A_328P: u16 = 0x0047;
+pub const OCR0B_328P: u16 = 0x0048;
+pub const TIFR0_328P: u16 = 0x0035;
+pub const TIMSK0_328P: u16 = 0x006E;
+
+pub const TCCR1A_328P: u16 = 0x0080;
+pub const TCCR1B_328P: u16 = 0x0081;
+pub const TCNT1L_328P: u16 = 0x0084;
+pub const TCNT1H_328P: u16 = 0x0085;
+pub const OCR1AL_328P: u16 = 0x0088;
+pub const OCR1AH_328P: u16 = 0x0089;
+pub const OCR1BL_328P: u16 = 0x008A;
+pub const OCR1BH_328P: u16 = 0x008B;
+pub const TIFR1_328P: u16 = 0x0036;
+pub const TIMSK1_328P: u16 = 0x006F;
+
+pub const TCCR2A_328P: u16 = 0x00B0;
+pub const TCCR2B_328P: u16 = 0x00B1;
+pub const TCNT2_328P: u16 = 0x00B2;
+pub const OCR2A_328P: u16 = 0x00B4;
+pub const OCR2B_328P: u16 = 0x00B5;
+pub const TIFR2_328P: u16 = 0x0037;
+pub const TIMSK2_328P: u16 = 0x0070;
+
+pub const UCSR0A_328P: u16 = 0x00C0;
+pub const UCSR0B_328P: u16 = 0x00C1;
+pub const UCSR0C_328P: u16 = 0x00C2;
+pub const UBRR0L_328P: u16 = 0x00C4;
+pub const UBRR0H_328P: u16 = 0x00C5;
+pub const UDR0_328P: u16 = 0x00C6;
 
 /// ports tuple label port_ddr_pin_mem
 pub const PORTS: [(&str, u16, u16, u16); 7] = [

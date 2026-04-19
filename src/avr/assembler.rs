@@ -303,6 +303,7 @@ fn builtin_equates(model: McuModel) -> HashMap<String, u32> {
     add("TCCR3A", io_map::TCCR3A as u32);
     add("TCCR3C", io_map::TCCR3C as u32);
     add("UBRR0H", io_map::UBRR0H as u32);
+    add("UCSR0C", io_map::UCSR0C as u32);
     add("UCSR1A", io_map::UCSR1A as u32);
     add("UCSR1B", io_map::UCSR1B as u32);
     add("UCSR1C", io_map::UCSR1C as u32);
@@ -815,17 +816,192 @@ fn rewrite_local_refs(
 
 fn is_data_directive(line: &str) -> bool {
     let m = line.split_whitespace().next().unwrap_or("").to_uppercase();
-    matches!(m.as_str(), ".BYTE" | ".DB" | ".WORD" | ".SHORT")
+    matches!(
+        m.as_str(),
+        ".BYTE" | ".DB" | ".ASCIZ" | ".WORD" | ".SHORT"
+    )
+}
+
+fn split_comma_outside_quotes(rest: &str) -> Vec<&str> {
+    let b = rest.as_bytes();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut out: Vec<&str> = Vec::new();
+    while i < b.len() {
+        if in_str {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if b[i] == b'\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if b[i] == b',' {
+            out.push(rest[start..i].trim());
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(rest[start..].trim());
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+fn hex_digit_nibble(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("invalid hex digit (0x{c:02X}) in \\x escape")),
+    }
+}
+
+fn parse_db_string_operand(segment: &str) -> Result<Vec<u8>, String> {
+    let s = segment.trim();
+    let b = s.as_bytes();
+    if b.is_empty() || b[0] != b'"' {
+        return Err(format!("expected string literal, got '{s}'"));
+    }
+    let mut i = 1usize;
+    let mut out = Vec::new();
+    while i < b.len() {
+        if b[i] == b'"' {
+            if i + 1 != b.len() {
+                return Err("trailing garbage after closing '\"' of string literal".to_string());
+            }
+            return Ok(out);
+        }
+        if b[i] == b'\\' {
+            if i + 1 >= b.len() {
+                return Err("unterminated escape in string literal".to_string());
+            }
+            i += 1;
+            match b[i] {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'0' => out.push(0),
+                b'x' => {
+                    if i + 2 >= b.len() {
+                        return Err("incomplete \\xNN in string literal".to_string());
+                    }
+                    let hi = hex_digit_nibble(b[i + 1])?;
+                    let lo = hex_digit_nibble(b[i + 2])?;
+                    out.push((hi << 4) | lo);
+                    i += 2;
+                }
+                other => {
+                    return Err(format!(
+                        "invalid escape sequence in string literal (0x{other:02X})"
+                    ));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    Err("unterminated string literal".to_string())
+}
+
+fn db_byte_count_for_labeling(rest: &str) -> u32 {
+    let parts = split_comma_outside_quotes(rest);
+    let mut n = 0u32;
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.starts_with('"') {
+            if let Ok(v) = parse_db_string_operand(p) {
+                n += v.len() as u32;
+            } else {
+                n += 1;
+            }
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn collect_db_bytes(
+    rest: &str,
+    equates: &HashMap<String, u32>,
+    labels: &HashMap<String, u32>,
+) -> Result<Vec<u8>, String> {
+    let parts = split_comma_outside_quotes(rest);
+    let mut all = Vec::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.starts_with('"') {
+            all.extend(parse_db_string_operand(p)?);
+        } else {
+            let v = sym(p, equates, Some(labels))?;
+            if v > 0xFF {
+                return Err(format!(
+                    ".DB operand '{p}' is {v} (does not fit in one byte)"
+                ));
+            }
+            all.push(v as u8);
+        }
+    }
+    Ok(all)
+}
+
+fn pack_db_bytes_to_words(bytes: &[u8]) -> Vec<u16> {
+    if bytes.is_empty() {
+        return vec![0x0000];
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let lo = bytes[i] as u16;
+        let hi = if i + 1 < bytes.len() {
+            bytes[i + 1] as u16
+        } else {
+            0x00
+        };
+        out.push(lo | (hi << 8));
+        i += 2;
+    }
+    out
 }
 
 fn instruction_words(line: &str) -> u32 {
     let (m, rest) = line.split_once(|c: char| c.is_whitespace()).unwrap_or((line, ""));
+    let rest = rest.trim();
     match m.to_uppercase().as_str() {
         "LDS" | "STS" | "JMP" | "CALL" => 2,
         ".BYTE" | ".DB" => {
             // each pair of bytes → 1 word; at least 1 word
-            let count = rest.split(',').filter(|s| !s.trim().is_empty()).count();
-            ((count as u32 + 1) / 2).max(1)
+            let byte_count = db_byte_count_for_labeling(rest);
+            ((byte_count + 1) / 2).max(1)
+        }
+        ".ASCIZ" => {
+            let byte_count = db_byte_count_for_labeling(rest).saturating_add(1);
+            ((byte_count + 1) / 2).max(1)
         }
         ".WORD" | ".SHORT" => {
             rest.split(',').filter(|s| !s.trim().is_empty()).count() as u32
@@ -871,20 +1047,13 @@ fn encode(
 
     // data_directives — `.DB` = flash bytes in .CSEG (AVR); `.BYTE` is only valid in .DSEG / .ESEG (checked in assemble_inner).
     if m == ".BYTE" || m == ".DB" {
-        let bytes: Vec<u8> = rest.split(',')
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| sym(s.trim(), equates, Some(labels)).map(|v| v as u8))
-            .collect::<Result<_, _>>()?;
-        if bytes.is_empty() { return Ok(vec![0x0000]); }
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            let lo = bytes[i] as u16;
-            let hi = if i + 1 < bytes.len() { bytes[i + 1] as u16 } else { 0x00 };
-            out.push(lo | (hi << 8));
-            i += 2;
-        }
-        return Ok(out);
+        let bytes = collect_db_bytes(rest, equates, labels)?;
+        return Ok(pack_db_bytes_to_words(&bytes));
+    }
+    if m == ".ASCIZ" {
+        let mut bytes = collect_db_bytes(rest, equates, labels)?;
+        bytes.push(0);
+        return Ok(pack_db_bytes_to_words(&bytes));
     }
     if m == ".WORD" || m == ".SHORT" {
         let words: Vec<u16> = rest.split(',')
@@ -1963,5 +2132,52 @@ mod tests {
     fn asm_db_in_cseg_ok() {
         assert_eq!(assemble(&b128(".DB 0xc3")).unwrap(), &[0x00C3]);
         assert_eq!(assemble(&b128(".CSEG\n.DB 0x01, 0x02")).unwrap(), &[0x0201]);
+    }
+
+    #[test]
+    fn asm_db_string_literal() {
+        let w = assemble(&b128(
+            r#".CSEG
+String_XYZ:
+    .db "enter xyz", 0x0D, 0x0A, 0
+"#,
+        ))
+        .unwrap();
+        let expected = b"enter xyz\r\n\0";
+        let mut got = Vec::new();
+        for word in w {
+            got.push((word & 0xFF) as u8);
+            got.push((word >> 8) as u8);
+        }
+        assert_eq!(&got[..expected.len()], expected);
+
+        let w2 = assemble(&b128(".CSEG\n.DB \"a,b\", 0")).unwrap();
+        assert_eq!(w2.len(), 2);
+        assert_eq!(w2[0], u16::from_le_bytes([b'a', b',']));
+        assert_eq!(w2[1], u16::from_le_bytes([b'b', 0]));
+    }
+
+    #[test]
+    fn asm_asciz_appends_null() {
+        // .asciz "OK" ≡ .db "OK", 0
+        let w = assemble(&b128(".CSEG\n.asciz \"OK\"")).unwrap();
+        let mut got = Vec::new();
+        for word in &w {
+            got.push((word & 0xFF) as u8);
+            got.push((word >> 8) as u8);
+        }
+        assert_eq!(&got[..3], b"OK\0");
+
+        let w_empty = assemble(&b128(".CSEG\n.asciz \"\"")).unwrap();
+        assert_eq!(w_empty, &[0x0000]);
+
+        // Same operands as .db plus trailing 0
+        let w2 = assemble(&b128(".CSEG\n.asciz \"x\", 0x0D")).unwrap();
+        let mut b2 = Vec::new();
+        for word in &w2 {
+            b2.push((word & 0xFF) as u8);
+            b2.push((word >> 8) as u8);
+        }
+        assert_eq!(&b2[..3], &[b'x', 0x0D, 0]);
     }
 }

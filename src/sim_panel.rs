@@ -24,7 +24,7 @@ const PERIPH_DIM: Color32 = Color32::from_rgb(120, 95, 40);
 const FLASH_PER_PAGE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SimTab { Cpu, Ports, Timers, Sram, Flash, Break, Stack }
+pub enum SimTab { Cpu, Ports, Timers, Uart, Sram, Flash, Break, Stack }
 
 // stack_popup_state
 pub struct StackState {
@@ -190,10 +190,10 @@ fn sim_tab_button(ui: &mut Ui, active_tab: &mut SimTab, tab: SimTab, label: &'st
     };
     let sw = if selected { 1.0 } else { 0.75 };
     let resp = ui.add(
-        Button::new(RichText::new(label).monospace().size(11.5).color(color))
+        Button::new(RichText::new(label).monospace().size(10.0).color(color))
             .fill(fill)
             .stroke(Stroke::new(sw, stroke_col))
-            .corner_radius(CornerRadius::same(5)),
+            .corner_radius(CornerRadius::same(4)),
     );
     if resp.clicked() {
         *active_tab = tab;
@@ -264,6 +264,7 @@ pub fn show_sim_panel(
                     (SimTab::Cpu,    "CPU"),
                     (SimTab::Ports,  "PORTS"),
                     (SimTab::Timers, "TIMERS"),
+                    (SimTab::Uart,   "UART"),
                     (SimTab::Sram,   "SRAM"),
                     (SimTab::Flash,  "FLASH"),
                     (SimTab::Break,  "BREAK"),
@@ -290,6 +291,10 @@ pub fn show_sim_panel(
                             SimAction::None
                         }
                         SimTab::Timers => show_timers_tab(ui, cpu),
+                        SimTab::Uart   => {
+                            show_uart_tab(ui, cpu, board_known, assembled_board);
+                            SimAction::None
+                        }
                         SimTab::Sram   => show_sram_tab(ui, cpu, xmem_state, board_known),
                         SimTab::Flash  => { show_flash_tab(ui, cpu, flash_state, board_known); SimAction::None }
                         SimTab::Break  => { show_break_tab(ui, bp_state);       SimAction::None }
@@ -303,85 +308,125 @@ pub fn show_sim_panel(
             ui.separator();
             ui.add_space(4.0);
 
-            if assemble_btn(ui, "ASSEMBLE  (from editor)").clicked() {
-                action = SimAction::Assemble;
+            let sticky = show_sim_sticky_controls(
+                ui,
+                auto_running,
+                ips,
+                speed_limit,
+                "ASSEMBLE  (from editor)",
+                "ips_unit",
+            );
+            if sticky != SimAction::None {
+                action = sticky;
             }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if retro_btn(ui, "STEP").clicked()        { action = SimAction::Step; }
-                if retro_btn(ui, "RUN\u{00D7}10").clicked()  { action = SimAction::Run10; }
-                if retro_btn(ui, "RUN\u{00D7}100").clicked() { action = SimAction::Run100; }
-                if retro_btn(ui, "RESET").clicked()       { action = SimAction::Reset; }
-            });
-            ui.add_space(4.0);
-            // AUTO + IPS display
-            ui.horizontal(|ui| {
-                if auto_running {
-                    if ui.add(
-                        Button::new(
-                            RichText::new("\u{25A0} STOP").monospace().size(12.5).color(START_GREEN),
-                        )
-                        .fill(theme::SIM_STOP_FILL)
-                        .stroke(Stroke::new(1.0, theme::SIM_STOP_BORDER))
-                        .corner_radius(CornerRadius::same(5)),
-                    ).clicked() {
-                        action = SimAction::AutoToggle;
-                    }
-                } else if ui.add(
-                    Button::new(
-                        RichText::new("\u{25B6} AUTO").monospace().size(12.5).color(START_GREEN),
-                    )
-                    .fill(theme::SIM_SURFACE_LIFT)
-                    .stroke(Stroke::new(1.0, theme::SIM_BORDER_BRIGHT))
-                    .corner_radius(CornerRadius::same(5)),
-                ).clicked() {
-                    action = SimAction::AutoToggle;
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(fmt_ips(ips, auto_running))
-                        .monospace()
-                        .size(12.0)
-                        .color(if auto_running { FOCUS } else { DIM }),
-                );
-            });
-            // speed-limit row
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut speed_limit.enabled,
-                    RichText::new("Limit:").monospace().size(11.0).color(START_GREEN_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut speed_limit.value_text)
-                        .desired_width(44.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                egui::ComboBox::from_id_salt("ips_unit")
-                    .width(58.0)
-                    .selected_text(
-                        RichText::new(speed_limit.unit.label())
-                            .monospace().size(11.0).color(START_GREEN),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.style_mut().visuals.override_text_color = Some(START_GREEN);
-                        for u in [IpsUnit::Ips, IpsUnit::Kips, IpsUnit::Mips] {
-                            ui.selectable_value(
-                                &mut speed_limit.unit, u,
-                                RichText::new(u.label()).monospace().size(11.0),
-                            );
-                        }
-                    });
-                if let Some(lim) = speed_limit.limit_ips() {
-                    ui.label(
-                        RichText::new(format!("= {}", fmt_ips_plain(lim)))
-                            .monospace().size(10.5).color(DIM),
-                    );
-                }
-            });
         });
 
     action
+}
+
+pub fn show_sim_sticky_controls(
+    ui:            &mut Ui,
+    auto_running:  bool,
+    ips:           f64,
+    speed_limit:   &mut SpeedLimitState,
+    assemble_label: &'static str,
+    ips_combo_id:   &'static str,
+) -> SimAction {
+    let mut action = SimAction::None;
+    if assemble_btn(ui, assemble_label).clicked() {
+        action = SimAction::Assemble;
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if retro_btn(ui, "STEP").clicked()        { action = SimAction::Step; }
+        if retro_btn(ui, "RUN\u{00D7}10").clicked()  { action = SimAction::Run10; }
+        if retro_btn(ui, "RUN\u{00D7}100").clicked() { action = SimAction::Run100; }
+        if retro_btn(ui, "RESET").clicked()       { action = SimAction::Reset; }
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if auto_running {
+            if ui.add(
+                Button::new(
+                    RichText::new("\u{25A0} STOP").monospace().size(12.5).color(START_GREEN),
+                )
+                .fill(theme::SIM_STOP_FILL)
+                .stroke(Stroke::new(1.0, theme::SIM_STOP_BORDER))
+                .corner_radius(CornerRadius::same(5)),
+            ).clicked() {
+                action = SimAction::AutoToggle;
+            }
+        } else if ui.add(
+            Button::new(
+                RichText::new("\u{25B6} AUTO").monospace().size(12.5).color(START_GREEN),
+            )
+            .fill(theme::SIM_SURFACE_LIFT)
+            .stroke(Stroke::new(1.0, theme::SIM_BORDER_BRIGHT))
+            .corner_radius(CornerRadius::same(5)),
+        ).clicked() {
+            action = SimAction::AutoToggle;
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(fmt_ips(ips, auto_running))
+                .monospace()
+                .size(12.0)
+                .color(if auto_running { FOCUS } else { DIM }),
+        );
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut speed_limit.enabled,
+            RichText::new("Limit:").monospace().size(11.0).color(START_GREEN_DIM),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut speed_limit.value_text)
+                .desired_width(44.0)
+                .font(egui::TextStyle::Monospace),
+        );
+        egui::ComboBox::from_id_salt(ips_combo_id)
+            .width(58.0)
+            .selected_text(
+                RichText::new(speed_limit.unit.label())
+                    .monospace().size(11.0).color(START_GREEN),
+            )
+            .show_ui(ui, |ui| {
+                ui.style_mut().visuals.override_text_color = Some(START_GREEN);
+                for u in [IpsUnit::Ips, IpsUnit::Kips, IpsUnit::Mips] {
+                    ui.selectable_value(
+                        &mut speed_limit.unit, u,
+                        RichText::new(u.label()).monospace().size(11.0),
+                    );
+                }
+            });
+        if let Some(lim) = speed_limit.limit_ips() {
+            ui.label(
+                RichText::new(format!("= {}", fmt_ips_plain(lim)))
+                    .monospace().size(10.5).color(DIM),
+            );
+        }
+    });
+    action
+}
+
+pub fn show_sim_machine_status_row(ui: &mut Ui, cpu: &Cpu) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("PC  {:04X}", cpu.pc))
+                .monospace().size(12.5).color(FOCUS),
+        );
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(format!("SP  {:04X}", cpu.sp))
+                .monospace().size(12.5).color(START_GREEN_DIM),
+        );
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(format!("CYC {}", cpu.cycles))
+                .monospace().size(12.5).color(START_GREEN_DIM),
+        );
+    });
 }
 
 // cpu_tab
@@ -649,8 +694,326 @@ fn show_ports_tab(ui: &mut Ui, cpu: &Cpu, peripheral_pins: &[(char, u8)]) {
     }
 }
 
+// uart_tab — register view (Microchip datasheet register names and addresses)
+fn show_uart_tab(ui: &mut Ui, cpu: &Cpu, board_known: bool, assembled_board: Option<McuModel>) {
+    if !board_known {
+        ui.label(
+            RichText::new("Assemble with a `.board` line to see USART registers for ATmega328P or ATmega128A.")
+                .monospace()
+                .size(10.5)
+                .color(DIM),
+        );
+        return;
+    }
+    let model = assembled_board.unwrap_or(McuModel::Atmega328P);
+    section_label(ui, "USART REGISTERS");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Status/control bits follow the datasheet.")
+            .monospace()
+            .size(10.0)
+            .color(DIM),
+    );
+    ui.add_space(6.0);
+
+    match model {
+        McuModel::Atmega328P => show_uart_tab_m328p(ui, cpu),
+        McuModel::Atmega128A => show_uart_tab_m128a(ui, cpu),
+    }
+}
+
+fn show_uart_tab_m328p(ui: &mut Ui, cpu: &Cpu) {
+    let io = &cpu.io;
+    let ix = |a: u16| -> u8 { io[(a as usize) - 0x0020] };
+    let ua = cpu.peek_mem(io_map::UCSR0A_328P);
+    let ub = ix(io_map::UCSR0B_328P);
+    let uc = ix(io_map::UCSR0C_328P);
+    let ubl = ix(io_map::UBRR0L_328P);
+    let ubh = ix(io_map::UBRR0H_328P);
+    let udr = cpu.peek_mem(io_map::UDR0_328P);
+    let ubrr = ((ubh as u16) << 8) | ubl as u16;
+
+    timer_section(ui, "USART0", "(mem-mapped 0xC0–0xC6)");
+    Grid::new("uart_328p").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "UCSR0A", &format!("{ua:02X}"), "see UCSR0A in datasheet");
+        kv3(ui, "UCSR0B", &format!("{ub:02X}"), "RXCIE0 TXCIE0 UDRIE0 RXEN0 TXEN0 …");
+        kv3(ui, "UCSR0C", &format!("{uc:02X}"), "UMSEL01:00 UCSZ01:00 UPM01:00 USBS0 UCPOL0");
+        kv3(ui, "UBRR0L", &format!("{ubl:02X}"), &format!("UBRR11:0 = {ubrr}"));
+        kv3(ui, "UBRR0H", &format!("{ubh:02X}"), "");
+        kv3(ui, "UDR0", &format!("{udr:02X}"), "USART I/O data");
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        flag_lbl(ui, "RXC0", ua & 0x80 != 0);
+        flag_lbl(ui, "TXC0", ua & 0x40 != 0);
+        flag_lbl(ui, "UDRE0", ua & 0x20 != 0);
+    });
+}
+
+fn show_uart_tab_m128a(ui: &mut Ui, cpu: &Cpu) {
+    let io = &cpu.io;
+    let ix = |a: u16| -> u8 { io[(a as usize) - 0x0020] };
+
+    timer_section(ui, "USART0", "(std I/O 0x09–0x0C; UBRR0H/UCSR0C ext. 0x90/0x95)");
+    {
+        let ua = cpu.peek_mem(io_map::UCSR0A);
+        let ub = ix(io_map::UCSR0B);
+        let uc = ix(io_map::UCSR0C);
+        let ubl = ix(io_map::UBRR0L);
+        let ubh = ix(io_map::UBRR0H);
+        let udr = cpu.peek_mem(io_map::UDR0);
+        let ubrr = ((ubh as u16) << 8) | ubl as u16;
+        Grid::new("uart_m128_u0").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+            kv3(ui, "UCSR0A", &format!("{ua:02X}"), "");
+            kv3(ui, "UCSR0B", &format!("{ub:02X}"), "");
+            kv3(ui, "UCSR0C", &format!("{uc:02X}"), "");
+            kv3(ui, "UBRR0L", &format!("{ubl:02X}"), &format!("UBRR11:0 = {ubrr}"));
+            kv3(ui, "UBRR0H", &format!("{ubh:02X}"), "");
+            kv3(ui, "UDR0", &format!("{udr:02X}"), "");
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            flag_lbl(ui, "RXC0", ua & 0x80 != 0);
+            flag_lbl(ui, "TXC0", ua & 0x40 != 0);
+            flag_lbl(ui, "UDRE0", ua & 0x20 != 0);
+        });
+    }
+
+    ui.add_space(8.0);
+    timer_section(ui, "USART1", "(ext I/O 0x98–0x9D)");
+    {
+        let ua = cpu.peek_mem(io_map::UCSR1A);
+        let ub = ix(io_map::UCSR1B);
+        let uc = ix(io_map::UCSR1C);
+        let ubl = ix(io_map::UBRR1L);
+        let ubh = ix(io_map::UBRR1H);
+        let udr = cpu.peek_mem(io_map::UDR1);
+        let ubrr = ((ubh as u16) << 8) | ubl as u16;
+        Grid::new("uart_m128_u1").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+            kv3(ui, "UCSR1A", &format!("{ua:02X}"), "");
+            kv3(ui, "UCSR1B", &format!("{ub:02X}"), "");
+            kv3(ui, "UCSR1C", &format!("{uc:02X}"), "");
+            kv3(ui, "UBRR1L", &format!("{ubl:02X}"), &format!("UBRR11:0 = {ubrr}"));
+            kv3(ui, "UBRR1H", &format!("{ubh:02X}"), "");
+            kv3(ui, "UDR1", &format!("{udr:02X}"), "");
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            flag_lbl(ui, "RXC1", ua & 0x80 != 0);
+            flag_lbl(ui, "TXC1", ua & 0x40 != 0);
+            flag_lbl(ui, "UDRE1", ua & 0x20 != 0);
+        });
+    }
+}
+
 // timers_tab
+fn show_timers_tab_m328p(ui: &mut Ui, cpu: &Cpu) -> SimAction {
+    let mut action = SimAction::None;
+    let io = &cpu.io;
+    let ix = |a: u16| -> u8 { io[(a as usize) - 0x0020] };
+
+    let tifr0 = ix(io_map::TIFR0_328P);
+    let timsk0 = ix(io_map::TIMSK0_328P);
+
+    timer_section(ui, "TIMER 0", "(8-bit)");
+
+    let tccr0a = ix(io_map::TCCR0A_328P);
+    let tccr0b = ix(io_map::TCCR0B_328P);
+    let wgm0 = (tccr0a & 0x03) | (((tccr0b >> 3) & 1) << 2);
+    let mode0 = match wgm0 {
+        0 => "Normal",
+        1 => "PWM, Phase Correct",
+        2 => "CTC",
+        3 => "Fast PWM",
+        4 | 5 => "Reserved",
+        6 => "PWM, Phase Correct",
+        7 => "Fast PWM",
+        _ => "?",
+    };
+    let cs0 = tccr0b & 0x07;
+
+    let tcnt0 = ix(io_map::TCNT0_328P);
+    let ocr0a = ix(io_map::OCR0A_328P);
+    let ocr0b = ix(io_map::OCR0B_328P);
+
+    Grid::new("t0_grid_328p").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "TCCR0A", &format!("{tccr0a:02X}"), mode0);
+        kv3(ui, "TCCR0B", &format!("{tccr0b:02X}"),
+            &format!("{}  {}", t01_cs_str(cs0), ""));
+        kv3(ui, "TCNT0", &format!("{tcnt0:02X}"), &format!("[{}]", tcnt0));
+        kv3(ui, "OCR0A", &format!("{ocr0a:02X}"), &format!("[{}]", ocr0a));
+        kv3(ui, "OCR0B", &format!("{ocr0b:02X}"), &format!("[{}]", ocr0b));
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        flag_lbl(ui, "TOV0",  tifr0 & 0x01 != 0);
+        flag_lbl(ui, "OCF0A", tifr0 & 0x02 != 0);
+        flag_lbl(ui, "OCF0B", tifr0 & 0x04 != 0);
+        ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
+        flag_lbl(ui, "TOIE0",  timsk0 & 0x01 != 0);
+        flag_lbl(ui, "OCIE0A", timsk0 & 0x02 != 0);
+        flag_lbl(ui, "OCIE0B", timsk0 & 0x04 != 0);
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+
+    let tifr1 = ix(io_map::TIFR1_328P);
+    let timsk1 = ix(io_map::TIMSK1_328P);
+
+    timer_section(ui, "TIMER 1", "(16-bit)");
+
+    let tccr1a = ix(io_map::TCCR1A_328P);
+    let tccr1b = ix(io_map::TCCR1B_328P);
+    let tcnt1 = (ix(io_map::TCNT1H_328P) as u16) << 8 | ix(io_map::TCNT1L_328P) as u16;
+    let ocr1a = (ix(io_map::OCR1AH_328P) as u16) << 8 | ix(io_map::OCR1AL_328P) as u16;
+    let ocr1b = (ix(io_map::OCR1BH_328P) as u16) << 8 | ix(io_map::OCR1BL_328P) as u16;
+    let cs1 = tccr1b & 0x07;
+    let ctc1 = (tccr1b & 0x08) != 0;
+
+    Grid::new("t1_grid_328p").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "TCCR1A", &format!("{tccr1a:02X}"), "");
+        kv3(ui, "TCCR1B", &format!("{tccr1b:02X}"),
+            &format!("{}  {}", t01_cs_str(cs1), if ctc1 { "CTC" } else { "Normal" }));
+        kv3(ui, "TCNT1", &format!("{tcnt1:04X}"), &format!("[{}]", tcnt1));
+        kv3(ui, "OCR1A", &format!("{ocr1a:04X}"), &format!("[{}]", ocr1a));
+        kv3(ui, "OCR1B", &format!("{ocr1b:04X}"), &format!("[{}]", ocr1b));
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        flag_lbl(ui, "TOV1",  tifr1 & 0x01 != 0);
+        flag_lbl(ui, "OCF1A", tifr1 & 0x02 != 0);
+        flag_lbl(ui, "OCF1B", tifr1 & 0x04 != 0);
+        flag_lbl(ui, "ICF1",  tifr1 & 0x20 != 0);
+        ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
+        flag_lbl(ui, "TOIE1",  timsk1 & 0x01 != 0);
+        flag_lbl(ui, "OCIE1A", timsk1 & 0x02 != 0);
+        flag_lbl(ui, "OCIE1B", timsk1 & 0x04 != 0);
+        flag_lbl(ui, "ICIE1",  timsk1 & 0x20 != 0);
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+
+    let tifr2 = ix(io_map::TIFR2_328P);
+    let timsk2 = ix(io_map::TIMSK2_328P);
+
+    timer_section(ui, "TIMER 2", "(8-bit async)");
+
+    let tccr2a = ix(io_map::TCCR2A_328P);
+    let tccr2b = ix(io_map::TCCR2B_328P);
+    let wgm2 = (tccr2a & 0x03) | (((tccr2b >> 3) & 1) << 2);
+    let mode2 = match wgm2 {
+        0 => "Normal",
+        1 => "PWM, Phase Correct",
+        2 => "CTC",
+        3 => "Fast PWM",
+        4 | 5 => "Reserved",
+        6 => "PWM, Phase Correct",
+        7 => "Fast PWM",
+        _ => "?",
+    };
+    let cs2 = tccr2b & 0x07;
+    let tcnt2 = ix(io_map::TCNT2_328P);
+    let ocr2a = ix(io_map::OCR2A_328P);
+    let ocr2b = ix(io_map::OCR2B_328P);
+
+    Grid::new("t2_grid_328p").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "TCCR2A", &format!("{tccr2a:02X}"), mode2);
+        kv3(ui, "TCCR2B", &format!("{tccr2b:02X}"),
+            &format!("{}  {}", t2_cs_str(cs2), ""));
+        kv3(ui, "TCNT2", &format!("{tcnt2:02X}"), &format!("[{}]", tcnt2));
+        kv3(ui, "OCR2A", &format!("{ocr2a:02X}"), &format!("[{}]", ocr2a));
+        kv3(ui, "OCR2B", &format!("{ocr2b:02X}"), &format!("[{}]", ocr2b));
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        flag_lbl(ui, "TOV2",  tifr2 & 0x01 != 0);
+        flag_lbl(ui, "OCF2A", tifr2 & 0x02 != 0);
+        flag_lbl(ui, "OCF2B", tifr2 & 0x04 != 0);
+        ui.label(RichText::new(" | ").monospace().size(11.0).color(DIM));
+        flag_lbl(ui, "TOIE2",  timsk2 & 0x01 != 0);
+        flag_lbl(ui, "OCIE2A", timsk2 & 0x02 != 0);
+        flag_lbl(ui, "OCIE2B", timsk2 & 0x04 != 0);
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+
+    section_label(ui, "REGISTERS (raw)");
+    ui.add_space(2.0);
+    Grid::new("tmr_raw_328p").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+        kv3(ui, "TIMSK0", &format!("{timsk0:02X}"), &format!("{timsk0:08b}b"));
+        kv3(ui, "TIMSK1", &format!("{timsk1:02X}"), &format!("{timsk1:08b}b"));
+        kv3(ui, "TIMSK2", &format!("{timsk2:02X}"), &format!("{timsk2:08b}b"));
+        kv3(ui, "TIFR0", &format!("{tifr0:02X}"), &format!("{tifr0:08b}b"));
+        kv3(ui, "TIFR1", &format!("{tifr1:02X}"), &format!("{tifr1:08b}b"));
+        kv3(ui, "TIFR2", &format!("{tifr2:02X}"), &format!("{tifr2:08b}b"));
+    });
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    section_label(ui, "MANUAL IRQ TRIGGERS");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Force-set interrupt flags to test ISRs (SREG I must be set).")
+            .monospace().size(10.5).color(DIM),
+    );
+    ui.add_space(6.0);
+
+    let mut trig_btn = |ui: &mut Ui, label: &str, addr: u16, mask: u8| {
+        if ui.add(
+            Button::new(RichText::new(label).monospace().size(11.0).color(START_GREEN))
+                .fill(theme::SIM_SURFACE_LIFT)
+                .stroke(Stroke::new(0.75, theme::SIM_BORDER_BRIGHT))
+                .corner_radius(CornerRadius::same(5)),
+        ).clicked() {
+            action = SimAction::SetIoBit { addr, mask };
+        }
+    };
+
+    timer_section(ui, "TIMER 0 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV0", io_map::TIFR0_328P, 0x01);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF0A", io_map::TIFR0_328P, 0x02);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF0B", io_map::TIFR0_328P, 0x04);
+    });
+    ui.add_space(4.0);
+
+    timer_section(ui, "TIMER 1 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV1",  io_map::TIFR1_328P, 0x01);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF1A", io_map::TIFR1_328P, 0x02);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF1B", io_map::TIFR1_328P, 0x04);
+        ui.add_space(4.0);
+        trig_btn(ui, "ICF1",  io_map::TIFR1_328P, 0x20);
+    });
+    ui.add_space(4.0);
+
+    timer_section(ui, "TIMER 2 triggers", "");
+    ui.horizontal(|ui| {
+        trig_btn(ui, "TOV2",  io_map::TIFR2_328P, 0x01);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF2A", io_map::TIFR2_328P, 0x02);
+        ui.add_space(4.0);
+        trig_btn(ui, "OCF2B", io_map::TIFR2_328P, 0x04);
+    });
+
+    action
+}
+
 fn show_timers_tab(ui: &mut Ui, cpu: &Cpu) -> SimAction {
+    if cpu.model == McuModel::Atmega328P {
+        return show_timers_tab_m328p(ui, cpu);
+    }
     let mut action = SimAction::None;
     // data_addr_to_io_idx
     let io = &cpu.io;

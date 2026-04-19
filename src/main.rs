@@ -11,6 +11,7 @@ mod sim_panel;
 mod syntax;
 mod theme;
 mod toolbar;
+mod uart_panel;
 mod upload_panel;
 mod waveforms;
 mod word_helper;
